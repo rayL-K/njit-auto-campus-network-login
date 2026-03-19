@@ -217,13 +217,6 @@ login.bat --notify-test
 login.bat --no-notify
 ```
 
-## 安全说明
-
-- 不要把真实账号密码写入 Git 仓库。
-- `data.json` 已通过 `.gitignore` 排除。
-- `chromedriver.exe` 也不会提交到仓库。
-- 仓库只保存源码、脚本和说明文档，不保存敏感信息。
-
 ## 故障排查
 
 ### 1. 脚本运行后打开了浏览器
@@ -280,4 +273,4 @@ login.bat --no-notify
 
 ## 许可说明
 
-当前项目未单独提供许可证文件。
+使用MIT协议
