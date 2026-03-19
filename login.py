@@ -33,6 +33,9 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "data.json"
 LOG_DIR = BASE_DIR / "logs"
+ASSETS_DIR = BASE_DIR / "assets"
+ICON_DIR = ASSETS_DIR / "icons"
+APP_ICON_PATH = ASSETS_DIR / "campus_login.ico"
 CHROMEDRIVER_PATH = BASE_DIR / "chromedriver.exe"
 
 DEFAULT_PORTAL_ROOT = "http://172.31.255.156"
@@ -49,6 +52,13 @@ REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_INTERVAL_SECONDS = 15
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 
+TOAST_ICON_PATHS = {
+    "Success": ICON_DIR / "success.svg",
+    "Info": ICON_DIR / "info.svg",
+    "Warning": ICON_DIR / "warning.svg",
+    "Error": ICON_DIR / "error.svg",
+}
+
 POWERSHELL_TOAST_SCRIPT = r"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
@@ -58,11 +68,19 @@ $title = [System.Security.SecurityElement]::Escape($env:CAMPUS_LOGIN_TITLE)
 $message = [System.Security.SecurityElement]::Escape($env:CAMPUS_LOGIN_MESSAGE)
 $appId = if ($env:CAMPUS_LOGIN_APP_ID) { $env:CAMPUS_LOGIN_APP_ID } else { 'PowerShell' }
 $duration = if ($env:CAMPUS_LOGIN_DURATION -eq 'long') { 'long' } else { 'short' }
+$imageUri = $env:CAMPUS_LOGIN_IMAGE_URI
+$imageAlt = [System.Security.SecurityElement]::Escape($env:CAMPUS_LOGIN_IMAGE_ALT)
+$imageXml = ""
+
+if ($imageUri) {
+    $imageXml = "<image placement='appLogoOverride' src='$imageUri' hint-crop='circle' alt='$imageAlt'/>"
+}
 
 $toastXml = @"
 <toast duration="$duration">
   <visual>
     <binding template="ToastGeneric">
+      $imageXml
       <text>$title</text>
       <text>$message</text>
     </binding>
@@ -86,21 +104,30 @@ $title = $env:CAMPUS_LOGIN_TITLE
 $message = $env:CAMPUS_LOGIN_MESSAGE
 $timeout = [Math]::Max([int]$env:CAMPUS_LOGIN_TIMEOUT, 3000)
 $iconName = $env:CAMPUS_LOGIN_ICON
+$iconPath = $env:CAMPUS_LOGIN_ICON_PATH
 
 $systemIcon = switch ($iconName) {
     'Error'   { [System.Drawing.SystemIcons]::Error }
     'Warning' { [System.Drawing.SystemIcons]::Warning }
+    'Success' { [System.Drawing.SystemIcons]::Information }
     default   { [System.Drawing.SystemIcons]::Information }
 }
 
 $balloonIcon = switch ($iconName) {
     'Error'   { [System.Windows.Forms.ToolTipIcon]::Error }
     'Warning' { [System.Windows.Forms.ToolTipIcon]::Warning }
+    'Success' { [System.Windows.Forms.ToolTipIcon]::Info }
     default   { [System.Windows.Forms.ToolTipIcon]::Info }
 }
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
-$notify.Icon = $systemIcon
+$customIcon = $null
+if ($iconPath -and (Test-Path $iconPath)) {
+    $customIcon = New-Object System.Drawing.Icon($iconPath)
+    $notify.Icon = $customIcon
+} else {
+    $notify.Icon = $systemIcon
+}
 $notify.Visible = $true
 $notify.BalloonTipTitle = $title
 $notify.BalloonTipText = $message
@@ -108,6 +135,7 @@ $notify.BalloonTipIcon = $balloonIcon
 $notify.ShowBalloonTip($timeout)
 Start-Sleep -Milliseconds ($timeout + 1000)
 $notify.Dispose()
+if ($customIcon) { $customIcon.Dispose() }
 """
 
 OPERATOR_SUFFIX_HINTS = {
@@ -283,6 +311,19 @@ def make_session() -> requests.Session:
     return session
 
 
+def to_file_uri(path: Path) -> str:
+    """把本地路径转换为 Toast 可用的 file URI。"""
+    return path.resolve().as_uri()
+
+
+def get_toast_icon_uri(icon_name: str) -> str:
+    """根据通知类型选择对应的 SVG 图标。"""
+    icon_path = TOAST_ICON_PATHS.get(icon_name) or TOAST_ICON_PATHS.get("Info")
+    if not icon_path or not icon_path.exists():
+        return ""
+    return to_file_uri(icon_path)
+
+
 def mask_account(account: str) -> str:
     if not account:
         return "<unknown>"
@@ -313,6 +354,9 @@ def send_notification(
     env["CAMPUS_LOGIN_ICON"] = icon
     env["CAMPUS_LOGIN_APP_ID"] = "PowerShell"
     env["CAMPUS_LOGIN_DURATION"] = "short"
+    env["CAMPUS_LOGIN_IMAGE_URI"] = get_toast_icon_uri(icon)
+    env["CAMPUS_LOGIN_IMAGE_ALT"] = title[:64]
+    env["CAMPUS_LOGIN_ICON_PATH"] = str(APP_ICON_PATH) if APP_ICON_PATH.exists() else ""
     logging.info("准备发送通知：%s - %s", title, message)
 
     try:
@@ -1037,7 +1081,7 @@ def main() -> int:
 
         if result["connectivity_ok"]:
             result_message = f"{result_message} 外网连通性已确认。"
-            result_icon = "Info"
+            result_icon = "Success"
         else:
             result_message = f"{result_message} 但外网连通性未完全确认。"
             result_icon = "Warning"
