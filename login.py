@@ -51,7 +51,36 @@ REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_INTERVAL_SECONDS = 15
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 
-POWERSHELL_NOTIFY_SCRIPT = r"""
+POWERSHELL_TOAST_SCRIPT = r"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+Add-Type -AssemblyName System.Security
+
+$title = [System.Security.SecurityElement]::Escape($env:CAMPUS_LOGIN_TITLE)
+$message = [System.Security.SecurityElement]::Escape($env:CAMPUS_LOGIN_MESSAGE)
+$appId = if ($env:CAMPUS_LOGIN_APP_ID) { $env:CAMPUS_LOGIN_APP_ID } else { 'PowerShell' }
+$duration = if ($env:CAMPUS_LOGIN_DURATION -eq 'long') { 'long' } else { 'short' }
+
+$toastXml = @"
+<toast duration="$duration">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>$title</text>
+      <text>$message</text>
+    </binding>
+  </visual>
+</toast>
+"@
+
+$xml = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$xml.LoadXml($toastXml)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+$notifier.Show($toast)
+Start-Sleep -Seconds 2
+"""
+
+POWERSHELL_BALLOON_NOTIFY_SCRIPT = r"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -277,17 +306,30 @@ def send_notification(title: str, message: str, enabled: bool = True, icon: str 
     env["CAMPUS_LOGIN_MESSAGE"] = message.replace("\r", " ").replace("\n", " ")[:240]
     env["CAMPUS_LOGIN_TIMEOUT"] = "5000"
     env["CAMPUS_LOGIN_ICON"] = icon
+    env["CAMPUS_LOGIN_APP_ID"] = "PowerShell"
+    env["CAMPUS_LOGIN_DURATION"] = "short"
 
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", POWERSHELL_NOTIFY_SCRIPT],
+        toast_result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", POWERSHELL_TOAST_SCRIPT],
             capture_output=True,
             text=True,
             timeout=12,
             env=env,
         )
-        if result.returncode != 0:
-            logging.warning("Windows notification failed: %s", (result.stderr or result.stdout).strip())
+        if toast_result.returncode == 0:
+            return
+
+        logging.warning("Toast notification failed, falling back to balloon tip: %s", (toast_result.stderr or toast_result.stdout).strip())
+        balloon_result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", POWERSHELL_BALLOON_NOTIFY_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            env=env,
+        )
+        if balloon_result.returncode != 0:
+            logging.warning("Windows balloon notification failed: %s", (balloon_result.stderr or balloon_result.stdout).strip())
     except Exception as exc:
         logging.warning("Windows notification error: %s", exc)
 
