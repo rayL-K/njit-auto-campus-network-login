@@ -1,263 +1,282 @@
-# Campus WiFi Auto Login
+# 校园网自动登录
 
-## Overview
+## 项目简介
 
-`Campus WiFi Auto Login` is a Windows-based campus network automation script designed for scheduled morning reconnection.
+这是一个面向 Windows 的校园网自动登录脚本，适用于“夜间断网，早晨自动恢复联网”的使用场景。
 
-The project targets the following scenario:
+典型使用方式如下：
 
-- The campus network is unavailable during the nightly restricted period.
-- The computer remains powered on, locked, screen-off, sleeping, or hibernating overnight.
-- Windows Task Scheduler wakes or resumes the machine around `07:30`.
-- The script reconnects Wi-Fi, authenticates to the campus portal, and shows a Windows notification.
+- 夜里校园网进入限制时段后自动断网。
+- 电脑保持开机、锁屏、黑屏、睡眠或休眠状态。
+- Windows 计划任务在早上 `07:30` 触发脚本。
+- 脚本自动重连 Wi-Fi、认证校园网，并在结束时弹出结果通知。
 
-The current implementation no longer depends on `ChromeDriver` for the primary login path. Portal authentication is performed through direct HTTP requests, with Selenium kept only as a last-resort fallback.
+当前版本的主流程已经改为 **纯 HTTP 认证**，默认不会打开浏览器。
 
-## Features
+## 功能特性
 
-- Direct HTTP login through the campus portal.
-- Automatic Wi-Fi reconnection before authentication.
-- Online-status verification through `drcom/chkstatus`.
-- External connectivity confirmation after successful login.
-- Windows 10/11 style Toast notification support.
-- Balloon-tip notification fallback for compatibility.
-- Optional ChromeDriver cache maintenance after network recovery.
-- Final result notification is always sent at the end of the main login run.
-- Scheduled Task friendly startup through `login.bat`.
+- 自动检查校园网门户是否可达。
+- 门户不可达时自动重连已保存的 Wi-Fi 配置。
+- 通过 `drcom/chkstatus` 查询当前在线状态。
+- 通过 `drcom/login` 直接完成认证。
+- 认证完成后确认当前账号是否正确。
+- 可选外网连通性检查。
+- 脚本结束时统一弹出结果通知。
+- 优先使用 Win10/Win11 原生 Toast 通知。
+- Toast 不稳定时再补一个托盘气泡通知。
+- 浏览器兜底能力保留，但默认关闭。
+- ChromeDriver 本地维护能力保留，但默认关闭。
 
-## Repository Layout
+## 目录说明
 
 - `login.py`
-  Main application entrypoint.
+  主程序，负责 Wi-Fi 重连、校园网认证、状态校验和通知弹窗。
 - `login.bat`
-  Windows launcher used by Task Scheduler.
+  计划任务入口脚本，用于稳定调用 Python 环境。
 - `register_task.ps1`
-  Helper script for registering or updating the scheduled task.
+  用于注册或更新计划任务。
 - `data.example.json`
-  Example configuration file without sensitive information.
+  示例配置文件，不包含真实账号密码。
 - `data.json`
-  Local runtime configuration file. This file is intentionally ignored by Git.
+  本机实际运行配置文件，不会提交到 Git。
 
-## Requirements
+## 运行要求
 
-### Operating System
+### 系统要求
 
-- Windows 10 or Windows 11
+- Windows 10 或 Windows 11
 
-### Runtime
+### Python 依赖
 
-- Python environment with at least:
-  - `requests`
-  - `selenium`
+当前环境至少需要：
 
-### Local Requirements
+- `requests`
+- `selenium`
 
-- A saved campus Wi-Fi profile, for example `B132YYDS`
-- A valid campus portal account
-- A Windows user session available for desktop notifications
+虽然主流程默认不走浏览器，但保留了可选兜底逻辑，因此仍建议保留 `selenium`。
 
-## Configuration
+### 本地前置条件
 
-Create a local `data.json` file based on `data.example.json`.
+- 电脑已经保存校园 Wi-Fi 配置
+- 账号密码可正常登录校园网
+- Windows 用户会话存在，用于显示桌面通知
 
-### Minimal configuration
+## 配置文件
+
+请在本地创建 `data.json`，可参考 `data.example.json`。
+
+### 最小配置
 
 ```json
 {
-  "id": "your-student-id",
-  "password": "your-password",
+  "id": "你的学号",
+  "password": "你的密码",
   "operator": "中国移动"
 }
 ```
 
-### Recommended configuration
+### 推荐配置
 
 ```json
 {
-  "id": "your-student-id",
-  "password": "your-password",
+  "id": "你的学号",
+  "password": "你的密码",
   "operator": "中国移动",
   "account_suffix": "@cmcc",
   "wifi_profile": "B132YYDS",
   "notify": true,
   "enable_browser_fallback": false,
-  "post_login_driver_update": true,
+  "post_login_driver_update": false,
   "max_runtime_seconds": 900,
   "retry_interval_seconds": 15
 }
 ```
 
-### Important notes
+### 配置项说明
 
-- `account_suffix` is strongly recommended when the operator suffix is known.
-- `enable_browser_fallback` defaults to `false`, so successful runs do not open a browser.
-- `data.json` contains secrets and is excluded from version control by `.gitignore`.
-- `chromedriver.exe` is also excluded from Git because it is a local runtime binary, not project source.
+- `account_suffix`
+  已知运营商后缀时建议显式填写，例如 `@cmcc`。
+- `wifi_profile`
+  已保存的 Wi-Fi 配置名称。
+- `notify`
+  是否启用桌面通知。
+- `enable_browser_fallback`
+  是否允许在 HTTP 登录失败后再尝试浏览器兜底。默认关闭。
+- `post_login_driver_update`
+  是否在联网成功后维护本地 ChromeDriver。默认关闭。
+- `max_runtime_seconds`
+  脚本最大运行时长。
+- `retry_interval_seconds`
+  登录失败后的重试间隔。
 
-## Execution Flow
+## 执行流程
 
-The script runs in the following order:
+脚本运行时会按以下顺序执行：
 
-1. Check whether the campus portal is reachable.
-2. If the portal is unreachable, reconnect the saved Wi-Fi profile.
-3. Query the current portal state through `drcom/chkstatus`.
-4. If already online under the expected account, stop early.
-5. Otherwise, authenticate through `drcom/login`.
-6. Re-check portal state and verify the expected account.
-7. Confirm external connectivity.
-8. Send Windows notification.
-9. Optionally refresh the local ChromeDriver cache after network recovery.
+1. 检查校园网门户是否可达。
+2. 如果门户不可达，尝试重连已保存的 Wi-Fi。
+3. 查询当前在线状态。
+4. 如果已经是目标账号在线，则直接结束。
+5. 如果未在线，则通过 HTTP 接口直接认证。
+6. 再次校验当前在线账号是否正确。
+7. 可选检查外网连通性。
+8. 在脚本结束时弹出结果通知。
 
-## Notifications
+## 通知机制
 
-The project now prefers Windows 10/11 style Toast notifications.
+当前版本的通知策略如下：
 
-### Behavior
+- 优先发送 Windows 10/11 风格的 Toast 通知。
+- 然后再补一个托盘气泡通知，提升可见性。
+- 不再单独发送“启动通知”，只保留“结束结果通知”。
 
-- Primary mode: native Toast notification
-- Fallback mode: legacy notification-area balloon tip
-- Final login result notification is always emitted at the end of the run.
+结果通知覆盖以下情况：
 
-### Trigger points
+- 已经在线，无需重复认证
+- HTTP 认证成功
+- 外网连通性未完全确认
+- 可重试失败
+- 不可重试失败
+- 脚本异常退出
 
-- Task startup
-- HTTP login failure before browser fallback
-- Login success
-- Retryable failure
-- Non-retryable failure
-- Unexpected exception
-
-Use the following command to test the notification pipeline:
+测试通知命令：
 
 ```cmd
 login.bat --notify-test
 ```
 
-## Scheduled Task Setup
+## 计划任务配置
 
-Use the provided helper script to register or update the scheduled task:
+建议使用项目自带脚本注册计划任务：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\register_task.ps1
 ```
 
-The current recommended task configuration is:
+推荐任务配置如下：
 
-- Daily at `07:30`
+- 每天 `07:30`
 - `WakeToRun = true`
 - `StartWhenAvailable = true`
 - `RunOnlyIfNetworkAvailable = false`
-- Run as the interactive logged-in user
-- Highest available privileges
+- 使用当前登录用户运行
+- 以最高权限运行
 
-## Power and Sleep Requirements
+## 电源与休眠说明
 
-The script can run successfully in these states:
+当前脚本可以处理以下状态：
 
-- Screen off
-- Locked session
-- Normal running state
-- Sleep
-- Hibernate
+- 正常开机
+- 锁屏
+- 黑屏
+- 睡眠
+- 休眠
 
-The script cannot power on a fully shut down computer by itself.
+当前脚本不能处理以下状态：
 
-If the machine is completely shut down, automatic morning recovery requires one of the following:
+- 完全关机
 
-- BIOS/UEFI `RTC Wake` or `Resume by Alarm`
-- Wake-on-LAN with another always-on device
+如果电脑是完全关机状态，脚本本身无法开机，必须依赖：
 
-### Recommended overnight setup
+- BIOS/UEFI 的定时开机功能，例如 `RTC Wake`、`Resume by Alarm`
+- 或者 Wake-on-LAN
 
-- Stay signed in
-- Do not fully shut down the machine
-- Allow the display to turn off if desired
-- Use sleep or hibernate instead of shutdown when necessary
-- Keep wake timers enabled in Windows power settings
+### 推荐夜间状态
 
-## Common Commands
+最稳的方式是：
 
-### Query current portal state
+- 保持用户已登录
+- 不要完全关机
+- 允许显示器熄灭
+- 需要省电时用睡眠或休眠，而不是关机
+
+## 常用命令
+
+### 查询当前校园网状态
 
 ```cmd
 login.bat --status
 ```
 
-### Run the full login flow manually
+### 手动执行完整登录流程
 
 ```cmd
 login.bat
 ```
 
-### Test notifications only
+### 测试通知
 
 ```cmd
 login.bat --notify-test
 ```
 
-### Skip notifications for one run
+### 本次运行不弹通知
 
 ```cmd
 login.bat --no-notify
 ```
 
-## Security
+## 安全说明
 
-- Do not commit `data.json`.
-- Do not store real credentials in `data.example.json`.
-- Review scheduled task permissions periodically.
-- Treat the GitHub repository as source code only, not a credential store.
+- 不要把真实账号密码写入 Git 仓库。
+- `data.json` 已通过 `.gitignore` 排除。
+- `chromedriver.exe` 也不会提交到仓库。
+- 仓库只保存源码、脚本和说明文档，不保存敏感信息。
 
-## Troubleshooting
+## 故障排查
 
-### The task does not wake the computer
+### 1. 脚本运行后打开了浏览器
 
-Check the following:
+默认情况下不会。
 
-- The machine is sleeping or hibernating, not shut down.
-- Wake timers are enabled in the active Windows power plan.
-- BIOS/UEFI wake support is enabled.
-- The scheduled task still has `WakeToRun = true`.
+请检查：
 
-### The script runs but does not show a notification
+- `data.json` 中是否手动设置了 `"enable_browser_fallback": true`
+- 是否仍在运行旧版本脚本
+- 是否手动调用了其他调试脚本
 
-Check the following:
+### 2. 脚本结束后没有看到通知
 
-- The task is running in the interactive user session.
-- The user is still signed in.
-- Windows notifications are not disabled for the session.
-- `login.bat --notify-test` succeeds.
+当前版本会在结束时发送两种通知：
 
-### The script cannot authenticate
+- Toast 通知
+- 托盘气泡通知
 
-Check the following:
+如果仍然看不到，请检查：
 
-- `data.json` contains the correct account and password.
-- `account_suffix` matches the portal's expected operator suffix.
-- The Wi-Fi profile name is correct.
-- The campus portal address is still reachable from the local network.
+- 当前任务是否在交互用户会话中运行
+- 当前用户是否仍处于登录状态
+- 系统是否关闭了通知
 
-### ChromeDriver issues still appear
+### 3. 计划任务没有唤醒电脑
 
-The primary path no longer depends on ChromeDriver.
+请检查：
 
-If ChromeDriver problems appear, they are limited to the Selenium fallback path. In that case:
+- 电脑是否只是睡眠或休眠，而不是关机
+- 当前电源计划是否允许唤醒定时器
+- BIOS/UEFI 是否启用了相关唤醒能力
+- 计划任务是否仍保持 `WakeToRun = true`
 
-- Verify local Chrome is installed.
-- Keep `chromedriver.exe` available locally.
-- Allow post-login driver maintenance when the network is already online.
+### 4. HTTP 认证失败
 
-## Version Control
+请检查：
 
-This repository is intended to track source code and deployment scripts only.
+- `data.json` 中账号密码是否正确
+- `account_suffix` 是否正确
+- Wi-Fi 配置名称是否正确
+- 校园网门户地址是否仍然可访问
 
-Local runtime artifacts are excluded, including:
+## 版本控制说明
+
+仓库中只保留源码与部署脚本。
+
+以下内容不会提交到 Git：
 
 - `data.json`
 - `chromedriver.exe`
 - `logs/`
-- Python cache files
+- Python 缓存文件
 
-## License
+## 许可说明
 
-No license file is currently defined for this project.
+当前项目未单独提供许可证文件。

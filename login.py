@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Campus network auto-login script.
+校园网自动登录脚本。
 
-Primary flow:
-1. Reconnect the saved Wi-Fi profile if the campus portal is unreachable.
-2. Query portal status through /drcom/chkstatus.
-3. Authenticate directly through /drcom/login without opening Chrome.
-4. Verify that the expected account is online and, when possible, confirm
-   external connectivity.
-5. Show Windows notification-area popups for start, success, and failures.
+主流程：
+1. 如果校园网门户不可达，先重连已保存的 Wi-Fi 配置。
+2. 通过 /drcom/chkstatus 查询当前在线状态。
+3. 通过 /drcom/login 直接完成 HTTP 认证，不打开浏览器。
+4. 校验是否为期望账号，并尽可能确认外网连通性。
+5. 在脚本结束时弹出对应结果通知。
 
-Selenium is kept only as a last-resort fallback. ChromeDriver maintenance is
-handled after the network is online so the main login path is no longer blocked
-by offline driver checks.
+Selenium 仅作为可选兜底能力保留，默认关闭。
+ChromeDriver 的本地维护也默认关闭，避免任何不必要的浏览器相关动作。
 """
 
 from __future__ import annotations
@@ -130,38 +128,38 @@ OPERATOR_SUFFIX_HINTS = {
 
 
 class LoginError(RuntimeError):
-    """Base exception for login failures."""
+    """登录失败的基础异常。"""
 
 
 class RetryableLoginError(LoginError):
-    """A failure that can reasonably be retried."""
+    """可重试的登录失败。"""
 
 
 class NonRetryableLoginError(LoginError):
-    """A failure that should stop immediately."""
+    """不可重试的登录失败，应立即停止。"""
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Campus portal auto-login.")
+    parser = argparse.ArgumentParser(description="校园网门户自动登录。")
     parser.add_argument(
         "--status",
         action="store_true",
-        help="Only query and print the current campus portal status.",
+        help="仅查询并输出当前校园网状态。",
     )
     parser.add_argument(
         "--notify-test",
         action="store_true",
-        help="Show a Windows notification test popup and exit.",
+        help="弹出一条通知测试消息后退出。",
     )
     parser.add_argument(
         "--no-notify",
         action="store_true",
-        help="Disable Windows notifications for this run.",
+        help="本次运行不弹出通知。",
     )
     parser.add_argument(
         "--skip-driver-update",
         action="store_true",
-        help="Skip best-effort ChromeDriver cache maintenance after success.",
+        help="成功后跳过 ChromeDriver 的本地维护。",
     )
     return parser.parse_args()
 
@@ -183,7 +181,7 @@ def setup_logging() -> None:
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    logging.info("Log file: %s", log_path)
+    logging.info("日志文件：%s", log_path)
 
 
 def read_json_with_fallbacks(path: Path) -> dict[str, Any]:
@@ -194,7 +192,7 @@ def read_json_with_fallbacks(path: Path) -> dict[str, Any]:
                 return json.load(file)
         except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             last_error = exc
-    raise NonRetryableLoginError(f"Failed to load {path.name}: {last_error}")
+    raise NonRetryableLoginError(f"读取 {path.name} 失败：{last_error}")
 
 
 def as_bool(value: Any, default: bool) -> bool:
@@ -224,7 +222,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     expected_account = str(raw.get("expected_account", "")).strip()
 
     if not user_id or not password:
-        raise NonRetryableLoginError("data.json must contain non-empty 'id' and 'password'.")
+        raise NonRetryableLoginError("data.json 中必须包含非空的 id 和 password。")
 
     checks = []
     raw_checks = raw.get("connectivity_checks", DEFAULT_CONNECTIVITY_CHECKS)
@@ -270,7 +268,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "wifi_profile": wifi_profile,
         "portal_root": portal_root,
         "notify": as_bool(raw.get("notify"), True),
-        "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), True),
+        "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), False),
         "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), False),
         "connectivity_checks": checks,
         "max_runtime_seconds": max_runtime_seconds,
@@ -294,11 +292,18 @@ def mask_account(account: str) -> str:
     return f"{account[:3]}***"
 
 
-def send_notification(title: str, message: str, enabled: bool = True, icon: str = "Info") -> None:
+def send_notification(
+    title: str,
+    message: str,
+    enabled: bool = True,
+    icon: str = "Info",
+    always_show_balloon: bool = False,
+) -> None:
     if not enabled:
+        logging.info("本次运行已禁用通知，跳过结果弹窗。")
         return
     if os.environ.get("USERNAME", "").upper() == "SYSTEM":
-        logging.warning("Skipping Windows notification because the task is running as SYSTEM.")
+        logging.warning("当前任务以 SYSTEM 身份运行，无法显示桌面通知，已跳过。")
         return
 
     env = os.environ.copy()
@@ -308,6 +313,7 @@ def send_notification(title: str, message: str, enabled: bool = True, icon: str 
     env["CAMPUS_LOGIN_ICON"] = icon
     env["CAMPUS_LOGIN_APP_ID"] = "PowerShell"
     env["CAMPUS_LOGIN_DURATION"] = "short"
+    logging.info("准备发送通知：%s - %s", title, message)
 
     try:
         toast_result = subprocess.run(
@@ -317,19 +323,20 @@ def send_notification(title: str, message: str, enabled: bool = True, icon: str 
             timeout=12,
             env=env,
         )
-        if toast_result.returncode == 0:
-            return
+        if toast_result.returncode != 0:
+            logging.warning("Toast 通知发送失败，将继续尝试托盘气泡通知：%s", (toast_result.stderr or toast_result.stdout).strip())
 
-        logging.warning("Toast notification failed, falling back to balloon tip: %s", (toast_result.stderr or toast_result.stdout).strip())
-        balloon_result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", POWERSHELL_BALLOON_NOTIFY_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=12,
-            env=env,
-        )
-        if balloon_result.returncode != 0:
-            logging.warning("Windows balloon notification failed: %s", (balloon_result.stderr or balloon_result.stdout).strip())
+        if always_show_balloon or toast_result.returncode != 0:
+            balloon_result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", POWERSHELL_BALLOON_NOTIFY_SCRIPT],
+                capture_output=True,
+                text=True,
+                timeout=12,
+                env=env,
+            )
+            if balloon_result.returncode != 0:
+                logging.warning("托盘气泡通知发送失败：%s", (balloon_result.stderr or balloon_result.stdout).strip())
+        logging.info("通知发送流程结束。")
     except Exception as exc:
         logging.warning("Windows notification error: %s", exc)
 
@@ -597,8 +604,8 @@ def login_via_http(
 
     description = describe_login_failure(payload)
     if is_invalid_credentials_error(payload):
-        raise NonRetryableLoginError(f"Portal rejected the credentials: {description}")
-    raise RetryableLoginError(f"Portal login did not succeed: {description}")
+        raise NonRetryableLoginError(f"校园网门户拒绝了当前账号或密码：{description}")
+    raise RetryableLoginError(f"校园网门户登录未成功：{description}")
 
 
 def check_external_connectivity(session: requests.Session, checks: list[dict[str, str]]) -> tuple[bool, str]:
@@ -915,7 +922,7 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
 
     while time.time() < deadline:
         attempt += 1
-        logging.info("Login attempt %s started.", attempt)
+        logging.info("开始执行第 %s 次登录尝试。", attempt)
         try:
             return try_login_once(session, config)
         except NonRetryableLoginError:
@@ -930,13 +937,6 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
 
     if config["enable_browser_fallback"]:
         logging.warning("Direct HTTP login did not complete successfully. Trying browser fallback.")
-        send_notification(
-            "校园网自动登录",
-            "HTTP 登录未成功，正在尝试浏览器兜底。",
-            enabled=notify_enabled,
-            icon="Warning",
-        )
-
         if not portal_is_reachable(session, config["portal_root"]):
             connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
 
@@ -1000,17 +1000,11 @@ def main() -> int:
 
     if args.notify_test:
         send_notification("校园网自动登录", "这是一条测试通知。", enabled=notify_enabled)
-        logging.info("Notification test completed.")
+        logging.info("通知测试已完成。")
         return 0
 
     if args.status:
         return show_status(session, config)
-
-    send_notification(
-        "校园网自动登录",
-        "任务已启动，正在检查 Wi-Fi 和校园网认证状态。",
-        enabled=notify_enabled,
-    )
 
     try:
         result = run_login_flow(session, config, notify_enabled)
@@ -1051,14 +1045,25 @@ def main() -> int:
         result_title = "校园网自动登录成功"
         logging.info(result_message)
 
-        if config["post_login_driver_update"] and not args.skip_driver_update and result["connectivity_ok"]:
+        if (
+            config["enable_browser_fallback"]
+            and config["post_login_driver_update"]
+            and not args.skip_driver_update
+            and result["connectivity_ok"]
+        ):
             try:
                 maintain_local_chromedriver()
             except Exception as exc:
                 logging.warning("ChromeDriver maintenance skipped due to error: %s", exc)
 
     if result_title:
-        send_notification(result_title, result_message, enabled=notify_enabled, icon=result_icon)
+        send_notification(
+            result_title,
+            result_message,
+            enabled=notify_enabled,
+            icon=result_icon,
+            always_show_balloon=True,
+        )
 
     return exit_code
 

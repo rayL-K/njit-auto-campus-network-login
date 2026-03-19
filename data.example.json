@@ -6,7 +6,7 @@
   "wifi_profile": "B132YYDS",
   "notify": true,
   "enable_browser_fallback": false,
-  "post_login_driver_update": true,
+  "post_login_driver_update": false,
   "max_runtime_seconds": 900,
   "retry_interval_seconds": 15
 }

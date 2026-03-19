@@ -9,7 +9,7 @@ $root = Split-Path -Parent $PSCommandPath
 $batPath = Join-Path $root "login.bat"
 
 if (-not (Test-Path $batPath)) {
-    throw "Missing launcher: $batPath"
+    throw "找不到启动脚本：$batPath"
 }
 
 $userId = "$env:USERDOMAIN\$env:USERNAME"
@@ -34,13 +34,13 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Campus WiFi auto-login at 07:30 with wake support and desktop notifications." `
+    -Description "校园网自动登录任务，07:30 执行，支持唤醒和桌面通知。" `
     -Force | Out-Null
 
-Write-Host "Scheduled task updated:"
-Write-Host "  Name: $TaskName"
-Write-Host "  Time: $RunAt"
-Write-Host "  User: $userId"
-Write-Host "  WakeToRun: true"
-Write-Host "  RunOnlyIfNetworkAvailable: false"
-Write-Host "  LogonType: Interactive"
+Write-Host "计划任务已更新："
+Write-Host "  名称: $TaskName"
+Write-Host "  时间: $RunAt"
+Write-Host "  用户: $userId"
+Write-Host "  唤醒运行: true"
+Write-Host "  仅网络可用时运行: false"
+Write-Host "  登录类型: Interactive"
