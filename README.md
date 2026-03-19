@@ -22,6 +22,7 @@ The current implementation no longer depends on `ChromeDriver` for the primary l
 - Windows 10/11 style Toast notification support.
 - Balloon-tip notification fallback for compatibility.
 - Optional ChromeDriver cache maintenance after network recovery.
+- Final result notification is always sent at the end of the main login run.
 - Scheduled Task friendly startup through `login.bat`.
 
 ## Repository Layout
@@ -79,7 +80,7 @@ Create a local `data.json` file based on `data.example.json`.
   "account_suffix": "@cmcc",
   "wifi_profile": "B132YYDS",
   "notify": true,
-  "enable_browser_fallback": true,
+  "enable_browser_fallback": false,
   "post_login_driver_update": true,
   "max_runtime_seconds": 900,
   "retry_interval_seconds": 15
@@ -89,6 +90,7 @@ Create a local `data.json` file based on `data.example.json`.
 ### Important notes
 
 - `account_suffix` is strongly recommended when the operator suffix is known.
+- `enable_browser_fallback` defaults to `false`, so successful runs do not open a browser.
 - `data.json` contains secrets and is excluded from version control by `.gitignore`.
 - `chromedriver.exe` is also excluded from Git because it is a local runtime binary, not project source.
 
@@ -114,6 +116,7 @@ The project now prefers Windows 10/11 style Toast notifications.
 
 - Primary mode: native Toast notification
 - Fallback mode: legacy notification-area balloon tip
+- Final login result notification is always emitted at the end of the run.
 
 ### Trigger points
 

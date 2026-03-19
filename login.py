@@ -271,7 +271,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "portal_root": portal_root,
         "notify": as_bool(raw.get("notify"), True),
         "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), True),
-        "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), True),
+        "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), False),
         "connectivity_checks": checks,
         "max_runtime_seconds": max_runtime_seconds,
         "retry_interval_seconds": retry_interval_seconds,
@@ -993,6 +993,10 @@ def main() -> int:
     config = load_config()
     notify_enabled = config["notify"] and not args.no_notify
     session = make_session()
+    exit_code = 0
+    result_title = ""
+    result_message = ""
+    result_icon = "Info"
 
     if args.notify_test:
         send_notification("校园网自动登录", "这是一条测试通知。", enabled=notify_enabled)
@@ -1012,42 +1016,51 @@ def main() -> int:
         result = run_login_flow(session, config, notify_enabled)
     except NonRetryableLoginError as exc:
         logging.error("%s", exc)
-        send_notification("校园网自动登录失败", str(exc), enabled=notify_enabled, icon="Error")
-        return 3
+        exit_code = 3
+        result_title = "校园网自动登录失败"
+        result_message = str(exc)
+        result_icon = "Error"
     except RetryableLoginError as exc:
         logging.error("%s", exc)
-        send_notification("校园网自动登录失败", str(exc), enabled=notify_enabled, icon="Error")
-        return 2
+        exit_code = 2
+        result_title = "校园网自动登录失败"
+        result_message = str(exc)
+        result_icon = "Error"
     except Exception as exc:
         logging.exception("Unexpected failure")
-        send_notification("校园网自动登录异常", str(exc), enabled=notify_enabled, icon="Error")
-        return 4
-
-    account_text = result["account"]
-    if result["already_online"]:
-        message = f"校园网已在线，账号 {account_text} 无需重复认证。"
-    elif result["used_browser_fallback"]:
-        message = f"校园网已恢复联网，账号 {account_text}，使用了浏览器兜底。"
+        exit_code = 4
+        result_title = "校园网自动登录异常"
+        result_message = str(exc)
+        result_icon = "Error"
     else:
-        message = f"校园网已恢复联网，账号 {account_text}，通过 HTTP 直接认证成功。"
+        account_text = result["account"]
+        if result["already_online"]:
+            result_message = f"校园网已在线，账号 {account_text} 无需重复认证。"
+        elif result["used_browser_fallback"]:
+            result_message = f"校园网已恢复联网，账号 {account_text}，使用了浏览器兜底。"
+        else:
+            result_message = f"校园网已恢复联网，账号 {account_text}，未打开浏览器，直接通过 HTTP 认证成功。"
 
-    if result["connectivity_ok"]:
-        message = f"{message} 外网连通性已确认。"
-        icon = "Info"
-    else:
-        message = f"{message} 但外网连通性未完全确认。"
-        icon = "Warning"
+        if result["connectivity_ok"]:
+            result_message = f"{result_message} 外网连通性已确认。"
+            result_icon = "Info"
+        else:
+            result_message = f"{result_message} 但外网连通性未完全确认。"
+            result_icon = "Warning"
 
-    logging.info(message)
-    send_notification("校园网自动登录成功", message, enabled=notify_enabled, icon=icon)
+        result_title = "校园网自动登录成功"
+        logging.info(result_message)
 
-    if config["post_login_driver_update"] and not args.skip_driver_update and result["connectivity_ok"]:
-        try:
-            maintain_local_chromedriver()
-        except Exception as exc:
-            logging.warning("ChromeDriver maintenance skipped due to error: %s", exc)
+        if config["post_login_driver_update"] and not args.skip_driver_update and result["connectivity_ok"]:
+            try:
+                maintain_local_chromedriver()
+            except Exception as exc:
+                logging.warning("ChromeDriver maintenance skipped due to error: %s", exc)
 
-    return 0
+    if result_title:
+        send_notification(result_title, result_message, enabled=notify_enabled, icon=result_icon)
+
+    return exit_code
 
 
 if __name__ == "__main__":

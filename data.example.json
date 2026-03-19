@@ -5,7 +5,7 @@
   "account_suffix": "@cmcc",
   "wifi_profile": "B132YYDS",
   "notify": true,
-  "enable_browser_fallback": true,
+  "enable_browser_fallback": false,
   "post_login_driver_update": true,
   "max_runtime_seconds": 900,
   "retry_interval_seconds": 15
