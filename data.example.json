@@ -1,0 +1,12 @@
+{
+  "id": "your-student-id",
+  "password": "your-password",
+  "operator": "中国移动",
+  "account_suffix": "@cmcc",
+  "wifi_profile": "B132YYDS",
+  "notify": true,
+  "enable_browser_fallback": true,
+  "post_login_driver_update": true,
+  "max_runtime_seconds": 900,
+  "retry_interval_seconds": 15
+}

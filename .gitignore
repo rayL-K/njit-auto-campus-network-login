@@ -1,0 +1,12 @@
+data.json
+chromedriver.exe
+logs/
+__pycache__/
+.vscode/
+skills/
+current_portal.html
+a40.js
+a41.js
+page_*.html
+page_init_decoded.txt
+*.pyc
