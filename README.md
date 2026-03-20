@@ -22,7 +22,7 @@
 - 通过 `drcom/chkstatus` 查询当前在线状态。
 - 通过 `drcom/login` 直接完成认证。
 - 认证完成后确认当前账号是否正确。
-- 可选外网连通性检查。
+- 在等待窗口内重试确认外网连通性，避免刚恢复联网时误判。
 - 脚本结束时统一弹出结果通知。
 - 优先使用 Win10/Win11 原生 Toast 通知。
 - Toast 不稳定时再补一个托盘气泡通知。
@@ -89,6 +89,8 @@
   "notify": true,
   "enable_browser_fallback": false,
   "post_login_driver_update": false,
+  "connectivity_confirm_timeout_seconds": 45,
+  "connectivity_check_interval_seconds": 3,
   "max_runtime_seconds": 900,
   "retry_interval_seconds": 15
 }
@@ -110,6 +112,10 @@
   脚本最大运行时长。
 - `retry_interval_seconds`
   登录失败后的重试间隔。
+- `connectivity_confirm_timeout_seconds`
+  认证完成后用于确认外网是否恢复的最长等待时间。
+- `connectivity_check_interval_seconds`
+  外网连通性检查的重试间隔。
 
 ## 执行流程
 
@@ -121,7 +127,7 @@
 4. 如果已经是目标账号在线，则直接结束。
 5. 如果未在线，则通过 HTTP 接口直接认证。
 6. 再次校验当前在线账号是否正确。
-7. 可选检查外网连通性。
+7. 在等待窗口内重试确认外网连通性。
 8. 在脚本结束时弹出结果通知。
 
 ## 通知机制

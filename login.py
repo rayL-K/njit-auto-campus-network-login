@@ -51,6 +51,8 @@ DEFAULT_CONNECTIVITY_CHECKS = [
 REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_INTERVAL_SECONDS = 15
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
+DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS = 45
+DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS = 3
 
 TOAST_ICON_PATHS = {
     "Success": ICON_DIR / "success.svg",
@@ -250,7 +252,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     expected_account = str(raw.get("expected_account", "")).strip()
 
     if not user_id or not password:
-        raise NonRetryableLoginError("data.json 中必须包含非空的 id 和 password。")
+        raise NonRetryableLoginError("data.json 中必须包含非空的账号和密码。")
 
     checks = []
     raw_checks = raw.get("connectivity_checks", DEFAULT_CONNECTIVITY_CHECKS)
@@ -271,6 +273,14 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     max_runtime_seconds = raw.get("max_runtime_seconds", DEFAULT_MAX_RUNTIME_SECONDS)
     retry_interval_seconds = raw.get("retry_interval_seconds", DEFAULT_RETRY_INTERVAL_SECONDS)
     wifi_attempts = raw.get("wifi_attempts", 3)
+    connectivity_confirm_timeout_seconds = raw.get(
+        "connectivity_confirm_timeout_seconds",
+        DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS,
+    )
+    connectivity_check_interval_seconds = raw.get(
+        "connectivity_check_interval_seconds",
+        DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS,
+    )
 
     try:
         max_runtime_seconds = max(60, int(max_runtime_seconds))
@@ -287,6 +297,16 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     except (TypeError, ValueError):
         wifi_attempts = 3
 
+    try:
+        connectivity_confirm_timeout_seconds = max(0, int(connectivity_confirm_timeout_seconds))
+    except (TypeError, ValueError):
+        connectivity_confirm_timeout_seconds = DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS
+
+    try:
+        connectivity_check_interval_seconds = max(1, int(connectivity_check_interval_seconds))
+    except (TypeError, ValueError):
+        connectivity_check_interval_seconds = DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS
+
     return {
         "user_id": user_id,
         "password": password,
@@ -299,6 +319,8 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), False),
         "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), False),
         "connectivity_checks": checks,
+        "connectivity_confirm_timeout_seconds": connectivity_confirm_timeout_seconds,
+        "connectivity_check_interval_seconds": connectivity_check_interval_seconds,
         "max_runtime_seconds": max_runtime_seconds,
         "retry_interval_seconds": retry_interval_seconds,
         "wifi_attempts": wifi_attempts,
@@ -326,7 +348,7 @@ def get_toast_icon_uri(icon_name: str) -> str:
 
 def mask_account(account: str) -> str:
     if not account:
-        return "<unknown>"
+        return "<未知账号>"
     if "@" in account:
         user, suffix = account.split("@", 1)
         return f"{user[:3]}***@{suffix}"
@@ -382,7 +404,7 @@ def send_notification(
                 logging.warning("托盘气泡通知发送失败：%s", (balloon_result.stderr or balloon_result.stdout).strip())
         logging.info("通知发送流程结束。")
     except Exception as exc:
-        logging.warning("Windows notification error: %s", exc)
+        logging.warning("Windows 通知流程异常：%s", exc)
 
 
 def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -408,24 +430,24 @@ def wait_for_portal(session: requests.Session, portal_root: str, timeout_seconds
 
 def connect_wifi(profile_name: str, session: requests.Session, portal_root: str, attempts: int) -> bool:
     if portal_is_reachable(session, portal_root):
-        logging.info("Campus portal is already reachable. Skipping Wi-Fi reconnect.")
+        logging.info("校园网门户已可达，跳过 Wi-Fi 重连。")
         return True
 
     for attempt in range(1, attempts + 1):
-        logging.info("Connecting to Wi-Fi profile %s (attempt %s/%s)...", profile_name, attempt, attempts)
+        logging.info("正在连接 Wi-Fi 配置 %s（第 %s/%s 次尝试）。", profile_name, attempt, attempts)
         try:
             result = run_command(["netsh", "wlan", "connect", f"name={profile_name}"], timeout=30)
         except subprocess.TimeoutExpired:
-            logging.warning("Wi-Fi connect command timed out.")
+            logging.warning("Wi-Fi 连接命令执行超时。")
             result = None
 
         if result:
             output = " ".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
             if output:
-                logging.info("netsh output: %s", output)
+                logging.info("netsh 输出：%s", output)
 
         if wait_for_portal(session, portal_root, timeout_seconds=20):
-            logging.info("Campus portal became reachable after Wi-Fi reconnect.")
+            logging.info("Wi-Fi 重连后，校园网门户已恢复可达。")
             return True
 
         time.sleep(3)
@@ -472,12 +494,12 @@ def parse_jsonp_payload(text: str) -> dict[str, Any]:
     stripped = text.strip()
     match = re.match(r"^[^(]+\((.*)\)\s*;?$", stripped, re.DOTALL)
     if not match:
-        raise RetryableLoginError(f"Unexpected JSONP response: {stripped[:160]}")
+        raise RetryableLoginError(f"校园网门户返回了无法识别的 JSONP 响应：{stripped[:160]}")
 
     try:
         return json.loads(match.group(1))
     except json.JSONDecodeError as exc:
-        raise RetryableLoginError(f"Failed to parse portal response: {exc}") from exc
+        raise RetryableLoginError(f"解析校园网门户响应失败：{exc}") from exc
 
 
 def fetch_portal_html(session: requests.Session, portal_root: str) -> str:
@@ -486,7 +508,7 @@ def fetch_portal_html(session: requests.Session, portal_root: str) -> str:
         response.raise_for_status()
         return response.text
     except requests.RequestException as exc:
-        raise RetryableLoginError(f"Campus portal homepage is unreachable: {exc}") from exc
+        raise RetryableLoginError(f"校园网门户首页暂时无法访问：{exc}") from exc
 
 
 def check_portal_status(session: requests.Session, portal_root: str) -> dict[str, Any]:
@@ -498,7 +520,7 @@ def check_portal_status(session: requests.Session, portal_root: str) -> dict[str
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise RetryableLoginError(f"Failed to query portal status: {exc}") from exc
+        raise RetryableLoginError(f"查询校园网门户状态失败：{exc}") from exc
 
     return parse_jsonp_payload(response.text)
 
@@ -611,7 +633,7 @@ def login_via_http(
     js_version = extract_js_string(html, "fileVersion", "4.X") or "4.X"
 
     if not v4ip and not v6ip:
-        raise RetryableLoginError("Portal page did not expose the current device IP.")
+        raise RetryableLoginError("校园网门户页面未提供当前设备 IP，暂时无法发起认证。")
 
     params = {
         "callback": "campusLogin",
@@ -630,7 +652,7 @@ def login_via_http(
         "jsVersion": js_version,
     }
 
-    logging.info("Attempting direct portal login for %s.", mask_account(account))
+    logging.info("准备直接向校园网门户发起 HTTP 认证，账号 %s。", mask_account(account))
 
     try:
         response = session.get(
@@ -640,7 +662,7 @@ def login_via_http(
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise RetryableLoginError(f"Direct portal login request failed: {exc}") from exc
+        raise RetryableLoginError(f"向校园网门户发起 HTTP 认证请求失败：{exc}") from exc
 
     payload = parse_jsonp_payload(response.text)
     if portal_result_is_online(payload):
@@ -652,21 +674,68 @@ def login_via_http(
     raise RetryableLoginError(f"校园网门户登录未成功：{description}")
 
 
-def check_external_connectivity(session: requests.Session, checks: list[dict[str, str]]) -> tuple[bool, str]:
+def probe_external_connectivity_once(
+    session: requests.Session,
+    checks: list[dict[str, str]],
+) -> tuple[bool, str, str]:
+    last_reason = "当前所有外网探测地址均未通过。"
     for check in checks:
         url = check["url"]
         keyword = check.get("keyword", "")
         try:
             response = session.get(url, timeout=6, allow_redirects=True)
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            reason = f"{url} 请求失败：{exc}"
+            logging.info("外网探测未通过：%s", reason)
+            last_reason = reason
             continue
 
         if not 200 <= response.status_code < 400:
+            reason = f"{url} 返回状态码 {response.status_code}"
+            logging.info("外网探测未通过：%s", reason)
+            last_reason = reason
             continue
         if keyword and keyword not in response.text[:300]:
+            reason = f"{url} 返回内容未包含预期关键字"
+            logging.info("外网探测未通过：%s", reason)
+            last_reason = reason
             continue
-        return True, url
+        return True, url, ""
 
+    return False, "", last_reason
+
+
+def check_external_connectivity(
+    session: requests.Session,
+    checks: list[dict[str, str]],
+    confirm_timeout_seconds: int,
+    check_interval_seconds: int,
+) -> tuple[bool, str]:
+    deadline = time.time() + max(0, confirm_timeout_seconds)
+    attempt = 0
+    last_reason = "当前所有外网探测地址均未通过。"
+
+    while True:
+        attempt += 1
+        ok, checked_url, failure_reason = probe_external_connectivity_once(session, checks)
+        if ok:
+            logging.info("第 %s 次外网连通性检查成功：%s", attempt, checked_url)
+            return True, checked_url
+
+        last_reason = failure_reason or last_reason
+        remaining_seconds = deadline - time.time()
+        if remaining_seconds <= 0:
+            break
+
+        sleep_seconds = min(max(1, check_interval_seconds), max(1, int(remaining_seconds)))
+        logging.info(
+            "第 %s 次外网连通性检查未通过，将在 %s 秒后重试。",
+            attempt,
+            sleep_seconds,
+        )
+        time.sleep(sleep_seconds)
+
+    logging.warning("在 %s 秒等待窗口内仍未确认外网连通性：%s", confirm_timeout_seconds, last_reason)
     return False, ""
 
 
@@ -685,7 +754,7 @@ def get_chrome_version() -> str | None:
         if result.returncode == 0:
             match = re.search(r"(\d+)\.", result.stdout)
             if match:
-                logging.info("Chrome browser major version: %s", match.group(1))
+                logging.info("检测到本机 Chrome 主版本号：%s", match.group(1))
                 return match.group(1)
     return None
 
@@ -704,13 +773,13 @@ def get_local_chromedriver_version() -> str | None:
 
 
 def download_chromedriver(chrome_major_version: str) -> bool:
-    logging.info("Fetching Chrome-for-Testing metadata for Chrome %s...", chrome_major_version)
+    logging.info("正在获取适用于 Chrome %s 的 ChromeDriver 元数据。", chrome_major_version)
     try:
         response = requests.get(CHROME_FOR_TESTING_URL, timeout=30)
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        logging.warning("Failed to fetch ChromeDriver metadata: %s", exc)
+        logging.warning("获取 ChromeDriver 元数据失败：%s", exc)
         return False
 
     matching_version = None
@@ -720,7 +789,7 @@ def download_chromedriver(chrome_major_version: str) -> bool:
             break
 
     if not matching_version:
-        logging.warning("No matching ChromeDriver release found for Chrome %s.", chrome_major_version)
+        logging.warning("未找到与 Chrome %s 对应的 ChromeDriver 版本。", chrome_major_version)
         return False
 
     download_url = ""
@@ -730,7 +799,7 @@ def download_chromedriver(chrome_major_version: str) -> bool:
             break
 
     if not download_url:
-        logging.warning("No win64 ChromeDriver download was provided by Chrome-for-Testing.")
+        logging.warning("Chrome-for-Testing 未提供 win64 平台的 ChromeDriver 下载地址。")
         return False
 
     zip_path = BASE_DIR / "chromedriver.zip"
@@ -747,10 +816,10 @@ def download_chromedriver(chrome_major_version: str) -> bool:
             with archive.open(member) as source, CHROMEDRIVER_PATH.open("wb") as target:
                 shutil.copyfileobj(source, target)
 
-        logging.info("ChromeDriver cache updated to %s.", matching_version["version"])
+        logging.info("ChromeDriver 缓存已更新到版本 %s。", matching_version["version"])
         return True
     except Exception as exc:
-        logging.warning("ChromeDriver download/update failed: %s", exc)
+        logging.warning("下载或更新 ChromeDriver 失败：%s", exc)
         return False
     finally:
         if zip_path.exists():
@@ -760,15 +829,15 @@ def download_chromedriver(chrome_major_version: str) -> bool:
 def maintain_local_chromedriver() -> None:
     chrome_version = get_chrome_version()
     if not chrome_version:
-        logging.info("Chrome was not detected locally. Skipping ChromeDriver maintenance.")
+        logging.info("本机未检测到 Chrome，跳过 ChromeDriver 本地维护。")
         return
 
     driver_version = get_local_chromedriver_version()
     if driver_version == chrome_version:
-        logging.info("ChromeDriver cache already matches local Chrome.")
+        logging.info("当前 ChromeDriver 缓存已与本机 Chrome 版本匹配。")
         return
 
-    logging.info("ChromeDriver cache mismatch detected: Chrome=%s ChromeDriver=%s", chrome_version, driver_version)
+    logging.info("检测到 ChromeDriver 与本机 Chrome 版本不一致：Chrome=%s，ChromeDriver=%s", chrome_version, driver_version)
     download_chromedriver(chrome_version)
 
 
@@ -864,7 +933,7 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
                 continue
 
         if id_input is None:
-            logging.info("Browser fallback did not find a login form. Portal may already be online.")
+            logging.info("浏览器兜底未发现登录表单，校园网门户可能已经在线。")
             return
 
         for locator in [
@@ -879,7 +948,7 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
                 continue
 
         if password_input is None:
-            raise RetryableLoginError("Browser fallback could not find the password field.")
+            raise RetryableLoginError("浏览器兜底未找到密码输入框。")
 
         operator_applied = set_browser_operator(driver, config["operator"], suffix)
         if not operator_applied and suffix:
@@ -896,7 +965,7 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
                 continue
 
         if login_button is None:
-            raise RetryableLoginError("Browser fallback could not find the login button.")
+            raise RetryableLoginError("浏览器兜底未找到登录按钮。")
 
         id_input.clear()
         id_input.send_keys(account_input_value)
@@ -912,7 +981,7 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
     if not portal_is_reachable(session, config["portal_root"]):
         if not connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"]):
             raise RetryableLoginError(
-                f"Campus portal is still unreachable after reconnecting Wi-Fi profile {config['wifi_profile']}."
+                f"重连 Wi-Fi 配置 {config['wifi_profile']} 后，校园网门户仍然不可达。"
             )
 
     html = fetch_portal_html(session, config["portal_root"])
@@ -921,7 +990,12 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
     current_account = current_portal_account(status)
 
     if portal_result_is_online(status) and account_matches_expected(config, current_account, expected_account):
-        connectivity_ok, checked_url = check_external_connectivity(session, config["connectivity_checks"])
+        connectivity_ok, checked_url = check_external_connectivity(
+            session,
+            config["connectivity_checks"],
+            config["connectivity_confirm_timeout_seconds"],
+            config["connectivity_check_interval_seconds"],
+        )
         return {
             "account": current_account or expected_account,
             "already_online": True,
@@ -932,7 +1006,7 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
 
     if portal_result_is_online(status) and current_account:
         logging.warning(
-            "Portal reports another session is online: %s. Trying to replace it with %s.",
+            "校园网门户显示已有其他会话在线：%s。将尝试切换为目标账号 %s。",
             current_account,
             expected_account,
         )
@@ -943,13 +1017,18 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
     verified_status = check_portal_status(session, config["portal_root"])
     verified_account = current_portal_account(verified_status)
     if not portal_result_is_online(verified_status):
-        raise RetryableLoginError("Portal still reports offline after a direct login attempt.")
+        raise RetryableLoginError("HTTP 认证请求已发送，但校园网门户仍显示离线。")
     if not account_matches_expected(config, verified_account, account):
         raise RetryableLoginError(
-            f"Portal came online as {verified_account or '<unknown>'}, not as the expected account."
+            f"校园网门户已显示在线，但当前账号为 {verified_account or '<未知>'}，与期望账号不一致。"
         )
 
-    connectivity_ok, checked_url = check_external_connectivity(session, config["connectivity_checks"])
+    connectivity_ok, checked_url = check_external_connectivity(
+        session,
+        config["connectivity_checks"],
+        config["connectivity_confirm_timeout_seconds"],
+        config["connectivity_check_interval_seconds"],
+    )
     return {
         "account": verified_account or account,
         "already_online": False,
@@ -973,14 +1052,14 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
             raise
         except RetryableLoginError as exc:
             last_error = exc
-            logging.warning("Attempt %s failed: %s", attempt, exc)
+            logging.warning("第 %s 次登录尝试失败：%s", attempt, exc)
 
         if time.time() + config["retry_interval_seconds"] >= deadline:
             break
         time.sleep(config["retry_interval_seconds"])
 
     if config["enable_browser_fallback"]:
-        logging.warning("Direct HTTP login did not complete successfully. Trying browser fallback.")
+        logging.warning("直接 HTTP 认证未成功，将尝试浏览器兜底方案。")
         if not portal_is_reachable(session, config["portal_root"]):
             connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
 
@@ -993,13 +1072,18 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
         expected_account = build_login_account(config, infer_account_suffix(config, html, verified_status))
         verified_account = current_portal_account(verified_status)
         if not portal_result_is_online(verified_status):
-            raise last_error or RetryableLoginError("Browser fallback finished, but the portal still reports offline.")
+            raise last_error or RetryableLoginError("浏览器兜底已执行完毕，但校园网门户仍显示离线。")
         if not account_matches_expected(config, verified_account, expected_account):
             raise last_error or RetryableLoginError(
-                f"Browser fallback did not bring up the expected account: {verified_account or '<unknown>'}."
+                f"浏览器兜底未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
             )
 
-        connectivity_ok, checked_url = check_external_connectivity(session, config["connectivity_checks"])
+        connectivity_ok, checked_url = check_external_connectivity(
+            session,
+            config["connectivity_checks"],
+            config["connectivity_confirm_timeout_seconds"],
+            config["connectivity_check_interval_seconds"],
+        )
         return {
             "account": verified_account or expected_account,
             "already_online": False,
@@ -1008,26 +1092,26 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
             "connectivity_url": checked_url,
         }
 
-    raise last_error or RetryableLoginError("Campus network login did not succeed before the retry window ended.")
+    raise last_error or RetryableLoginError("在设定的重试时间窗口内，校园网认证仍未成功。")
 
 
 def show_status(session: requests.Session, config: dict[str, Any]) -> int:
     if not portal_is_reachable(session, config["portal_root"]):
-        logging.info("Campus portal is unreachable. Wi-Fi may be disconnected or not on campus network.")
+        logging.info("校园网门户不可达，可能尚未连接校园 Wi-Fi，或当前不在校园网环境。")
         return 2
 
     html = fetch_portal_html(session, config["portal_root"])
     status = check_portal_status(session, config["portal_root"])
     expected_account = build_login_account(config, infer_account_suffix(config, html, status))
-    current_account = current_portal_account(status) or "<offline>"
+    current_account = current_portal_account(status) or "<离线>"
     online = portal_result_is_online(status)
     matches = account_matches_expected(config, current_account, expected_account)
 
-    logging.info("Portal online: %s", online)
-    logging.info("Current account: %s", current_account)
-    logging.info("Expected account: %s", expected_account)
-    logging.info("Matches expectation: %s", matches)
-    logging.info("Current IPv4: %s", choose_v4ip(status, html) or "<unknown>")
+    logging.info("校园网门户在线状态：%s", online)
+    logging.info("当前账号：%s", current_account)
+    logging.info("期望账号：%s", expected_account)
+    logging.info("账号是否匹配：%s", matches)
+    logging.info("当前 IPv4：%s", choose_v4ip(status, html) or "<未知>")
     return 0 if online else 1
 
 
@@ -1065,7 +1149,7 @@ def main() -> int:
         result_message = str(exc)
         result_icon = "Error"
     except Exception as exc:
-        logging.exception("Unexpected failure")
+        logging.exception("脚本发生未预期异常")
         exit_code = 4
         result_title = "校园网自动登录异常"
         result_message = str(exc)
@@ -1098,7 +1182,7 @@ def main() -> int:
             try:
                 maintain_local_chromedriver()
             except Exception as exc:
-                logging.warning("ChromeDriver maintenance skipped due to error: %s", exc)
+                logging.warning("ChromeDriver 本地维护因异常被跳过：%s", exc)
 
     if result_title:
         send_notification(

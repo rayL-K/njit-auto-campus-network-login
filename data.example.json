@@ -1,12 +1,14 @@
 {
-  "id": "your-student-id",
-  "password": "your-password",
+  "id": "你的学号",
+  "password": "你的密码",
   "operator": "中国移动",
   "account_suffix": "@cmcc",
   "wifi_profile": "B132YYDS",
   "notify": true,
   "enable_browser_fallback": false,
   "post_login_driver_update": false,
+  "connectivity_confirm_timeout_seconds": 45,
+  "connectivity_check_interval_seconds": 3,
   "max_runtime_seconds": 900,
   "retry_interval_seconds": 15
 }
