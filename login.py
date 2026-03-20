@@ -428,12 +428,35 @@ def wait_for_portal(session: requests.Session, portal_root: str, timeout_seconds
     return False
 
 
-def connect_wifi(profile_name: str, session: requests.Session, portal_root: str, attempts: int) -> bool:
-    if portal_is_reachable(session, portal_root):
+def disconnect_wifi() -> None:
+    logging.info("正在主动断开当前 Wi-Fi 连接。")
+    try:
+        result = run_command(["netsh", "wlan", "disconnect"], timeout=15)
+    except subprocess.TimeoutExpired:
+        logging.warning("Wi-Fi 断开命令执行超时。")
+        return
+
+    output = " ".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+    if output:
+        logging.info("netsh 输出：%s", output)
+
+
+def connect_wifi(
+    profile_name: str,
+    session: requests.Session,
+    portal_root: str,
+    attempts: int,
+    force_reconnect: bool = False,
+) -> bool:
+    if not force_reconnect and portal_is_reachable(session, portal_root):
         logging.info("校园网门户已可达，跳过 Wi-Fi 重连。")
         return True
 
     for attempt in range(1, attempts + 1):
+        if force_reconnect:
+            disconnect_wifi()
+            time.sleep(2)
+
         logging.info("正在连接 Wi-Fi 配置 %s（第 %s/%s 次尝试）。", profile_name, attempt, attempts)
         try:
             result = run_command(["netsh", "wlan", "connect", f"name={profile_name}"], timeout=30)
@@ -453,6 +476,17 @@ def connect_wifi(profile_name: str, session: requests.Session, portal_root: str,
         time.sleep(3)
 
     return False
+
+
+def refresh_wifi_connection(profile_name: str, session: requests.Session, portal_root: str, attempts: int) -> bool:
+    logging.warning("校园网门户已认证，但外网仍未恢复，将尝试主动刷新 Wi-Fi 连接。")
+    return connect_wifi(
+        profile_name,
+        session,
+        portal_root,
+        attempts,
+        force_reconnect=True,
+    )
 
 
 def extract_js_string(html: str, name: str, default: str = "") -> str:
@@ -1045,14 +1079,41 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
 
     while time.time() < deadline:
         attempt += 1
+        should_sleep_before_retry = True
         logging.info("开始执行第 %s 次登录尝试。", attempt)
         try:
-            return try_login_once(session, config)
+            result = try_login_once(session, config)
+            if result["connectivity_ok"]:
+                return result
+
+            connectivity_message = (
+                f"校园网门户已认证为账号 {result['account']}，但外网仍未恢复，"
+                "本次不会判定为成功。"
+            )
+            last_error = RetryableLoginError(connectivity_message)
+            logging.warning("%s", connectivity_message)
+
+            refreshed = refresh_wifi_connection(
+                config["wifi_profile"],
+                session,
+                config["portal_root"],
+                config["wifi_attempts"],
+            )
+            if refreshed:
+                logging.info("Wi-Fi 刷新完成，将立即再次检查校园网状态。")
+                should_sleep_before_retry = False
+            else:
+                last_error = RetryableLoginError(
+                    f"{connectivity_message} 已尝试刷新 Wi-Fi，但校园网门户仍不可达。"
+                )
         except NonRetryableLoginError:
             raise
         except RetryableLoginError as exc:
             last_error = exc
             logging.warning("第 %s 次登录尝试失败：%s", attempt, exc)
+
+        if not should_sleep_before_retry:
+            continue
 
         if time.time() + config["retry_interval_seconds"] >= deadline:
             break
