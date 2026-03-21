@@ -45,8 +45,10 @@ CHROME_FOR_TESTING_URL = (
     "known-good-versions-with-downloads.json"
 )
 DEFAULT_CONNECTIVITY_CHECKS = [
-    {"url": "http://www.msftconnecttest.com/connecttest.txt", "keyword": "Microsoft Connect Test"},
-    {"url": "https://www.baidu.com", "keyword": ""},
+    {"url": "http://www.msftconnecttest.com/connecttest.txt", "keyword": "Microsoft Connect Test", "status": 200},
+    {"url": "http://www.msftncsi.com/ncsi.txt", "keyword": "Microsoft NCSI", "status": 200},
+    {"url": "http://connectivitycheck.gstatic.com/generate_204", "keyword": "", "status": 204},
+    {"url": "http://cp.cloudflare.com/generate_204", "keyword": "", "status": 204},
 ]
 REQUEST_TIMEOUT_SECONDS = 10
 DEFAULT_RETRY_INTERVAL_SECONDS = 15
@@ -261,10 +263,17 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
             if isinstance(item, str) and item.strip():
                 checks.append({"url": item.strip(), "keyword": ""})
             elif isinstance(item, dict) and item.get("url"):
+                parsed_status = item.get("status")
+                try:
+                    parsed_status = int(parsed_status) if parsed_status is not None else None
+                except (TypeError, ValueError):
+                    parsed_status = None
+
                 checks.append(
                     {
                         "url": str(item["url"]).strip(),
                         "keyword": str(item.get("keyword", "")).strip(),
+                        "status": parsed_status,
                     }
                 )
     if not checks:
@@ -330,6 +339,8 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
 def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": "CampusAutoLogin/2.0"})
+    # 忽略系统代理和环境变量（如 127.0.0.1:7897），直接建立连接
+    session.trust_env = False
     return session
 
 
@@ -708,29 +719,64 @@ def login_via_http(
     raise RetryableLoginError(f"校园网门户登录未成功：{description}")
 
 
+def logout_via_http(session: requests.Session, config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
+    v4ip = choose_v4ip(status, html)
+    v6ip = choose_v6ip(status, html)
+    
+    params = {
+        "callback": "campusLogout",
+        "wlan_user_ip": v4ip,
+        "v4ip": v4ip,
+        "v6ip": v6ip,
+    }
+    
+    logging.info("尝试执行 HTTP 强制注销。")
+    try:
+        session.get(
+            f"{config['portal_root']}/drcom/logout",
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        logging.warning("HTTP 注销请求异常：%s", exc)
+
+
 def probe_external_connectivity_once(
     session: requests.Session,
-    checks: list[dict[str, str]],
+    checks: list[dict[str, Any]],
 ) -> tuple[bool, str, str]:
     last_reason = "当前所有外网探测地址均未通过。"
     for check in checks:
         url = check["url"]
         keyword = check.get("keyword", "")
+        expected_status = check.get("status")
         try:
-            response = session.get(url, timeout=6, allow_redirects=True)
+            response = session.get(url, timeout=6, allow_redirects=False)
         except requests.RequestException as exc:
             reason = f"{url} 请求失败：{exc}"
             logging.info("外网探测未通过：%s", reason)
             last_reason = reason
             continue
 
-        if not 200 <= response.status_code < 400:
+        if expected_status is not None and response.status_code != expected_status:
+            location = response.headers.get("location")
+            reason = f"{url} 返回状态码 {response.status_code}，期望 {expected_status}"
+            if location:
+                reason = f"{reason}，跳转目标：{location}"
+            logging.info("外网探测未通过：%s", reason)
+            last_reason = reason
+            continue
+
+        if expected_status is None and not 200 <= response.status_code < 400:
             reason = f"{url} 返回状态码 {response.status_code}"
             logging.info("外网探测未通过：%s", reason)
             last_reason = reason
             continue
         if keyword and keyword not in response.text[:300]:
+            preview = response.text[:80].replace("\r", " ").replace("\n", " ").strip()
             reason = f"{url} 返回内容未包含预期关键字"
+            if preview:
+                reason = f"{reason}，响应片段：{preview}"
             logging.info("外网探测未通过：%s", reason)
             last_reason = reason
             continue
@@ -741,7 +787,7 @@ def probe_external_connectivity_once(
 
 def check_external_connectivity(
     session: requests.Session,
-    checks: list[dict[str, str]],
+    checks: list[dict[str, Any]],
     confirm_timeout_seconds: int,
     check_interval_seconds: int,
 ) -> tuple[bool, str]:
@@ -1030,20 +1076,26 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
             config["connectivity_confirm_timeout_seconds"],
             config["connectivity_check_interval_seconds"],
         )
-        return {
-            "account": current_account or expected_account,
-            "already_online": True,
-            "used_browser_fallback": False,
-            "connectivity_ok": connectivity_ok,
-            "connectivity_url": checked_url,
-        }
+        if connectivity_ok:
+            return {
+                "account": current_account or expected_account,
+                "already_online": True,
+                "used_browser_fallback": False,
+                "connectivity_ok": True,
+                "connectivity_url": checked_url,
+            }
+        
+        logging.warning("校园网显示已在线，但外网检测不通（假死状态）。执行注销重连。")
+        logout_via_http(session, config, html, status)
+        time.sleep(2)
 
     if portal_result_is_online(status) and current_account:
         logging.warning(
-            "校园网门户显示已有其他会话在线：%s。将尝试切换为目标账号 %s。",
+            "校园网门户显示已有在线会话：%s。尝试执行注销扫清障碍。",
             current_account,
-            expected_account,
         )
+        logout_via_http(session, config, html, status)
+        time.sleep(2)
 
     account, _ = login_via_http(session, config, html, status)
     time.sleep(3)
