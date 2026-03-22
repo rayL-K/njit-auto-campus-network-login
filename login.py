@@ -55,6 +55,7 @@ DEFAULT_RETRY_INTERVAL_SECONDS = 15
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS = 45
 DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS = 3
+DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS = 2
 
 TOAST_ICON_PATHS = {
     "Success": ICON_DIR / "success.svg",
@@ -290,6 +291,10 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "connectivity_check_interval_seconds",
         DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS,
     )
+    browser_fallback_after_attempts = raw.get(
+        "browser_fallback_after_attempts",
+        DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS,
+    )
 
     try:
         max_runtime_seconds = max(60, int(max_runtime_seconds))
@@ -316,6 +321,11 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     except (TypeError, ValueError):
         connectivity_check_interval_seconds = DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS
 
+    try:
+        browser_fallback_after_attempts = max(1, int(browser_fallback_after_attempts))
+    except (TypeError, ValueError):
+        browser_fallback_after_attempts = DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS
+
     return {
         "user_id": user_id,
         "password": password,
@@ -325,8 +335,9 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "wifi_profile": wifi_profile,
         "portal_root": portal_root,
         "notify": as_bool(raw.get("notify"), True),
-        "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), False),
-        "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), False),
+        "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), True),
+        "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), True),
+        "browser_fallback_after_attempts": browser_fallback_after_attempts,
         "connectivity_checks": checks,
         "connectivity_confirm_timeout_seconds": connectivity_confirm_timeout_seconds,
         "connectivity_check_interval_seconds": connectivity_check_interval_seconds,
@@ -828,6 +839,18 @@ def get_chrome_version() -> str | None:
         if not chrome_path.exists():
             continue
         try:
+            escaped_path = str(chrome_path).replace("'", "''")
+            ps_command = f"(Get-Item -LiteralPath '{escaped_path}').VersionInfo.ProductVersion"
+            result = run_command(["powershell", "-NoProfile", "-Command", ps_command], timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode == 0:
+            match = re.search(r"(\d+)\.", result.stdout.strip())
+            if match:
+                logging.info("检测到本机 Chrome 主版本号：%s", match.group(1))
+                return match.group(1)
+
+        try:
             result = run_command([str(chrome_path), "--version"], timeout=10)
         except subprocess.TimeoutExpired:
             continue
@@ -854,8 +877,10 @@ def get_local_chromedriver_version() -> str | None:
 
 def download_chromedriver(chrome_major_version: str) -> bool:
     logging.info("正在获取适用于 Chrome %s 的 ChromeDriver 元数据。", chrome_major_version)
+    download_session = requests.Session()
+    download_session.trust_env = False
     try:
-        response = requests.get(CHROME_FOR_TESTING_URL, timeout=30)
+        response = download_session.get(CHROME_FOR_TESTING_URL, timeout=30)
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
@@ -884,7 +909,7 @@ def download_chromedriver(chrome_major_version: str) -> bool:
 
     zip_path = BASE_DIR / "chromedriver.zip"
     try:
-        with requests.get(download_url, stream=True, timeout=60) as response:
+        with download_session.get(download_url, stream=True, timeout=60) as response:
             response.raise_for_status()
             with zip_path.open("wb") as output_file:
                 for chunk in response.iter_content(chunk_size=8192):
@@ -1057,6 +1082,41 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
         driver.quit()
 
 
+def run_browser_fallback(session: requests.Session, config: dict[str, Any], last_error: LoginError | None) -> dict[str, Any]:
+    logging.warning("直接 HTTP 认证未成功，将尝试无界面浏览器兜底方案。")
+    if not portal_is_reachable(session, config["portal_root"]):
+        connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
+
+    html = fetch_portal_html(session, config["portal_root"])
+    status = check_portal_status(session, config["portal_root"])
+    login_via_browser_fallback(config, html, status)
+    time.sleep(3)
+
+    verified_status = check_portal_status(session, config["portal_root"])
+    expected_account = build_login_account(config, infer_account_suffix(config, html, verified_status))
+    verified_account = current_portal_account(verified_status)
+    if not portal_result_is_online(verified_status):
+        raise last_error or RetryableLoginError("浏览器兜底已执行完毕，但校园网门户仍显示离线。")
+    if not account_matches_expected(config, verified_account, expected_account):
+        raise last_error or RetryableLoginError(
+            f"浏览器兜底未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
+        )
+
+    connectivity_ok, checked_url = check_external_connectivity(
+        session,
+        config["connectivity_checks"],
+        config["connectivity_confirm_timeout_seconds"],
+        config["connectivity_check_interval_seconds"],
+    )
+    return {
+        "account": verified_account or expected_account,
+        "already_online": False,
+        "used_browser_fallback": True,
+        "connectivity_ok": connectivity_ok,
+        "connectivity_url": checked_url,
+    }
+
+
 def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[str, Any]:
     if not portal_is_reachable(session, config["portal_root"]):
         if not connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"]):
@@ -1128,6 +1188,7 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
     deadline = time.time() + config["max_runtime_seconds"]
     attempt = 0
     last_error: LoginError | None = None
+    browser_fallback_tried = False
 
     while time.time() < deadline:
         attempt += 1
@@ -1164,6 +1225,15 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
             last_error = exc
             logging.warning("第 %s 次登录尝试失败：%s", attempt, exc)
 
+        if (
+            config["enable_browser_fallback"]
+            and not browser_fallback_tried
+            and attempt >= config["browser_fallback_after_attempts"]
+        ):
+            browser_fallback_tried = True
+            logging.warning("连续 %s 次 HTTP 恢复仍未成功，提前尝试无界面浏览器兜底。", attempt)
+            return run_browser_fallback(session, config, last_error)
+
         if not should_sleep_before_retry:
             continue
 
@@ -1171,39 +1241,8 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
             break
         time.sleep(config["retry_interval_seconds"])
 
-    if config["enable_browser_fallback"]:
-        logging.warning("直接 HTTP 认证未成功，将尝试浏览器兜底方案。")
-        if not portal_is_reachable(session, config["portal_root"]):
-            connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
-
-        html = fetch_portal_html(session, config["portal_root"])
-        status = check_portal_status(session, config["portal_root"])
-        login_via_browser_fallback(config, html, status)
-        time.sleep(3)
-
-        verified_status = check_portal_status(session, config["portal_root"])
-        expected_account = build_login_account(config, infer_account_suffix(config, html, verified_status))
-        verified_account = current_portal_account(verified_status)
-        if not portal_result_is_online(verified_status):
-            raise last_error or RetryableLoginError("浏览器兜底已执行完毕，但校园网门户仍显示离线。")
-        if not account_matches_expected(config, verified_account, expected_account):
-            raise last_error or RetryableLoginError(
-                f"浏览器兜底未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
-            )
-
-        connectivity_ok, checked_url = check_external_connectivity(
-            session,
-            config["connectivity_checks"],
-            config["connectivity_confirm_timeout_seconds"],
-            config["connectivity_check_interval_seconds"],
-        )
-        return {
-            "account": verified_account or expected_account,
-            "already_online": False,
-            "used_browser_fallback": True,
-            "connectivity_ok": connectivity_ok,
-            "connectivity_url": checked_url,
-        }
+    if config["enable_browser_fallback"] and not browser_fallback_tried:
+        return run_browser_fallback(session, config, last_error)
 
     raise last_error or RetryableLoginError("在设定的重试时间窗口内，校园网认证仍未成功。")
 

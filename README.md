@@ -28,8 +28,8 @@
 - 脚本结束时统一弹出结果通知。
 - 优先使用 Win10/Win11 原生 Toast 通知。
 - Toast 不稳定时再补一个托盘气泡通知。
-- 浏览器兜底能力保留，但默认关闭。
-- ChromeDriver 本地维护能力保留，但默认关闭。
+- 无界面浏览器兜底能力默认开启，但只在 HTTP 方案连续失败后才触发。
+- ChromeDriver 本地维护默认开启，用于保证无界面浏览器兜底可用。
 
 ## 目录说明
 
@@ -89,8 +89,9 @@
   "account_suffix": "@cmcc",
   "wifi_profile": "B132YYDS",
   "notify": true,
-  "enable_browser_fallback": false,
-  "post_login_driver_update": false,
+  "enable_browser_fallback": true,
+  "browser_fallback_after_attempts": 2,
+  "post_login_driver_update": true,
   "connectivity_confirm_timeout_seconds": 45,
   "connectivity_check_interval_seconds": 3,
   "max_runtime_seconds": 900,
@@ -106,10 +107,12 @@
   已保存的 Wi-Fi 配置名称。
 - `notify`
   是否启用桌面通知。
+- `browser_fallback_after_attempts`
+  连续多少次 HTTP 恢复失败后，提前切换到无界面浏览器兜底。
 - `enable_browser_fallback`
-  是否允许在 HTTP 登录失败后再尝试浏览器兜底。默认关闭。
+  是否允许在 HTTP 登录失败后再尝试无界面浏览器兜底。默认开启。
 - `post_login_driver_update`
-  是否在联网成功后维护本地 ChromeDriver。默认关闭。
+  是否在联网成功后维护本地 ChromeDriver。默认开启。
 - `max_runtime_seconds`
   脚本最大运行时长。
 - `retry_interval_seconds`
