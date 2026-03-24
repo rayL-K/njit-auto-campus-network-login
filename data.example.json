@@ -6,7 +6,7 @@
   "wifi_profile": "B132YYDS",
   "notify": true,
   "enable_browser_fallback": true,
-  "browser_fallback_after_attempts": 2,
+  "browser_fallback_after_attempts": 1,
   "post_login_driver_update": true,
   "connectivity_confirm_timeout_seconds": 45,
   "connectivity_check_interval_seconds": 3,

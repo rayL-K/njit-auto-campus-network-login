@@ -55,7 +55,7 @@ DEFAULT_RETRY_INTERVAL_SECONDS = 15
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS = 45
 DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS = 3
-DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS = 2
+DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS = 1
 
 TOAST_ICON_PATHS = {
     "Success": ICON_DIR / "success.svg",
@@ -946,29 +946,146 @@ def maintain_local_chromedriver() -> None:
     download_chromedriver(chrome_version)
 
 
-def init_browser():
+def init_browser(headless: bool = True):
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
     from selenium.webdriver.chrome.service import Service
 
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
+    if headless:
+        options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--window-size=1280,900")
+    options.add_argument("--disable-blink-features=AutomationControlled")
 
     errors = []
     if CHROMEDRIVER_PATH.exists():
         try:
             return webdriver.Chrome(service=Service(executable_path=str(CHROMEDRIVER_PATH)), options=options)
         except WebDriverException as exc:
-            errors.append(f"local ChromeDriver failed: {exc}")
+            errors.append(f"本地 ChromeDriver 启动失败：{exc}")
 
     try:
         return webdriver.Chrome(options=options)
     except WebDriverException as exc:
-        errors.append(f"Selenium Manager failed: {exc}")
-        raise RetryableLoginError(" ; ".join(errors)) from exc
+        errors.append(f"Selenium Manager 启动失败：{exc}")
+        raise RetryableLoginError("；".join(errors)) from exc
+
+
+def find_first_browser_element(wait, locators: list[tuple[Any, str]], clickable: bool = False):
+    from selenium.webdriver.support import expected_conditions as EC
+
+    for locator in locators:
+        try:
+            if clickable:
+                return wait.until(EC.element_to_be_clickable(locator))
+            return wait.until(EC.visibility_of_element_located(locator))
+        except Exception:
+            continue
+    return None
+
+
+def activate_browser_window(driver) -> bool:
+    try:
+        import pygetwindow as gw
+    except Exception as exc:
+        logging.warning("未能加载窗口激活组件，将继续尝试默认前台窗口：%s", exc)
+        return False
+
+    rect = driver.get_window_rect()
+    candidates = []
+    for window in gw.getAllWindows():
+        try:
+            if abs(window.left - rect["x"]) > 150:
+                continue
+            if abs(window.top - rect["y"]) > 150:
+                continue
+            if abs(window.width - rect["width"]) > 250:
+                continue
+            if abs(window.height - rect["height"]) > 250:
+                continue
+            candidates.append(window)
+        except Exception:
+            continue
+
+    if not candidates:
+        title = ""
+        try:
+            title = driver.title or ""
+        except Exception:
+            title = ""
+        if title:
+            candidates = [window for window in gw.getWindowsWithTitle(title) if window.title]
+
+    if not candidates:
+        candidates = [window for window in gw.getWindowsWithTitle("Chrome") if window.title]
+
+    if not candidates:
+        logging.warning("未找到可激活的 Chrome 窗口，将继续尝试默认前台输入。")
+        return False
+
+    target = max(candidates, key=lambda item: max(1, item.width) * max(1, item.height))
+    try:
+        if target.isMinimized:
+            target.restore()
+    except Exception:
+        pass
+
+    try:
+        target.activate()
+        time.sleep(0.5)
+        return True
+    except Exception as exc:
+        logging.warning("激活 Chrome 窗口失败：%s", exc)
+        return False
+
+
+def get_browser_element_screen_center(driver, element) -> tuple[int, int]:
+    metrics = driver.execute_script(
+        """
+        const target = arguments[0];
+        target.scrollIntoView({block: 'center', inline: 'center'});
+        const rect = target.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const borderX = (window.outerWidth - window.innerWidth) / 2;
+        const borderY = window.outerHeight - window.innerHeight;
+        return {
+            x: (window.screenX + borderX + rect.left + (rect.width / 2)) * dpr,
+            y: (window.screenY + borderY + rect.top + (rect.height / 2)) * dpr,
+        };
+        """,
+        element,
+    )
+    return int(round(metrics["x"])), int(round(metrics["y"]))
+
+
+def click_and_type_via_os_input(driver, element, text: str) -> None:
+    try:
+        import pyautogui
+    except Exception as exc:
+        raise RetryableLoginError(f"加载 pyautogui 失败，无法执行模拟键盘输入：{exc}") from exc
+
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0.15
+    center_x, center_y = get_browser_element_screen_center(driver, element)
+    pyautogui.click(center_x, center_y)
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.press("backspace")
+    pyautogui.write(text, interval=0.03)
+
+
+def click_via_os_input(driver, element) -> None:
+    try:
+        import pyautogui
+    except Exception as exc:
+        raise RetryableLoginError(f"加载 pyautogui 失败，无法执行模拟点击：{exc}") from exc
+
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0.15
+    center_x, center_y = get_browser_element_screen_center(driver, element)
+    pyautogui.click(center_x, center_y)
 
 
 def set_browser_operator(driver, operator: str, suffix: str) -> bool:
@@ -1006,71 +1123,117 @@ def set_browser_operator(driver, operator: str, suffix: str) -> bool:
     return False
 
 
-def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
+def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 
     suffix = infer_account_suffix(config, html, status)
-    account_input_value = config["user_id"]
-    if "@" not in account_input_value and not suffix:
-        account_input_value = build_login_account(config, suffix)
+    account_input_value = build_login_account(config, suffix)
 
-    driver = init_browser()
+    driver = init_browser(headless=False)
+    try:
+        driver.set_window_rect(80, 60, 1280, 900)
+        driver.get(f"{config['portal_root']}/")
+        wait = WebDriverWait(driver, 20)
+        time.sleep(3)
+        activate_browser_window(driver)
+
+        id_locators = [
+            (By.NAME, "DDDDD"),
+            (By.XPATH, "//*[@id='edit_body']//input[@name='DDDDD']"),
+            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[2]"),
+        ]
+        password_locators = [
+            (By.NAME, "upass"),
+            (By.XPATH, "//*[@id='edit_body']//input[@name='upass']"),
+            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[3]"),
+        ]
+        login_button_locators = [
+            (By.NAME, "0MKKey"),
+            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[1]"),
+        ]
+        logout_button_locators = [
+            (By.NAME, "logout"),
+            (By.CSS_SELECTOR, "input[name='logout']"),
+            (By.XPATH, "//input[@type='button' and contains(@value,'销')]"),
+        ]
+
+        id_input = find_first_browser_element(wait, id_locators)
+
+        if id_input is None:
+            logout_button = find_first_browser_element(wait, logout_button_locators, clickable=True)
+            if logout_button is not None:
+                logging.info("真实浏览器当前处于注销页，先模拟点击注销按钮。")
+                click_via_os_input(driver, logout_button)
+                time.sleep(5)
+                id_input = find_first_browser_element(wait, id_locators)
+
+        if id_input is None:
+            page_title = ""
+            try:
+                page_title = driver.title
+            except Exception:
+                page_title = ""
+            raise RetryableLoginError(f"真实浏览器键鼠兜底未发现登录表单。当前页面标题：{page_title or '<空>'}")
+
+        password_input = find_first_browser_element(wait, password_locators)
+
+        if password_input is None:
+            raise RetryableLoginError("真实浏览器键鼠兜底未找到密码输入框。")
+
+        login_button = find_first_browser_element(wait, login_button_locators, clickable=True)
+
+        if login_button is None:
+            raise RetryableLoginError("真实浏览器键鼠兜底未找到登录按钮。")
+
+        logging.info("开始执行真实浏览器模拟键鼠兜底。")
+        click_and_type_via_os_input(driver, id_input, account_input_value)
+        click_and_type_via_os_input(driver, password_input, config["password"])
+        click_via_os_input(driver, login_button)
+        time.sleep(5)
+    finally:
+        driver.quit()
+
+
+def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    suffix = infer_account_suffix(config, html, status)
+    account_input_value = build_login_account(config, suffix)
+
+    driver = init_browser(headless=True)
     try:
         driver.get(f"{config['portal_root']}/")
         wait = WebDriverWait(driver, 20)
         time.sleep(3)
 
-        id_input = None
-        password_input = None
-        login_button = None
-
-        for locator in [
+        id_input = find_first_browser_element(wait, [
             (By.NAME, "DDDDD"),
             (By.XPATH, "//*[@id='edit_body']//input[@name='DDDDD']"),
             (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[2]"),
-        ]:
-            try:
-                id_input = wait.until(EC.visibility_of_element_located(locator))
-                break
-            except Exception:
-                continue
+        ])
 
         if id_input is None:
-            logging.info("浏览器兜底未发现登录表单，校园网门户可能已经在线。")
+            logging.info("无界面浏览器兜底未发现登录表单，校园网门户可能已经在线。")
             return
 
-        for locator in [
+        password_input = find_first_browser_element(wait, [
             (By.NAME, "upass"),
             (By.XPATH, "//*[@id='edit_body']//input[@name='upass']"),
             (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[3]"),
-        ]:
-            try:
-                password_input = wait.until(EC.visibility_of_element_located(locator))
-                break
-            except Exception:
-                continue
+        ])
 
         if password_input is None:
-            raise RetryableLoginError("浏览器兜底未找到密码输入框。")
+            raise RetryableLoginError("无界面浏览器兜底未找到密码输入框。")
 
-        operator_applied = set_browser_operator(driver, config["operator"], suffix)
-        if not operator_applied and suffix:
-            account_input_value = build_login_account(config, suffix)
-
-        for locator in [
+        login_button = find_first_browser_element(wait, [
             (By.NAME, "0MKKey"),
             (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[1]"),
-        ]:
-            try:
-                login_button = wait.until(EC.element_to_be_clickable(locator))
-                break
-            except Exception:
-                continue
+        ], clickable=True)
 
         if login_button is None:
-            raise RetryableLoginError("浏览器兜底未找到登录按钮。")
+            raise RetryableLoginError("无界面浏览器兜底未找到登录按钮。")
 
         id_input.clear()
         id_input.send_keys(account_input_value)
@@ -1082,19 +1245,51 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
         driver.quit()
 
 
+def verify_portal_login_result(session: requests.Session, config: dict[str, Any], html: str) -> tuple[dict[str, Any], str, str]:
+    verified_status = check_portal_status(session, config["portal_root"])
+    expected_account = build_login_account(config, infer_account_suffix(config, html, verified_status))
+    verified_account = current_portal_account(verified_status)
+    return verified_status, expected_account, verified_account
+
+
 def run_browser_fallback(session: requests.Session, config: dict[str, Any], last_error: LoginError | None) -> dict[str, Any]:
-    logging.warning("直接 HTTP 认证未成功，将尝试无界面浏览器兜底方案。")
+    logging.warning("直接 HTTP 认证未成功，将尝试真实浏览器模拟键鼠兜底。")
     if not portal_is_reachable(session, config["portal_root"]):
         connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
 
     html = fetch_portal_html(session, config["portal_root"])
     status = check_portal_status(session, config["portal_root"])
-    login_via_browser_fallback(config, html, status)
-    time.sleep(3)
+    if portal_result_is_online(status):
+        logging.warning("进入浏览器兜底前，校园网门户仍显示在线，将先执行注销并刷新 Wi-Fi。")
+        logout_via_http(session, config, html, status)
+        time.sleep(2)
+        refresh_wifi_connection(
+            config["wifi_profile"],
+            session,
+            config["portal_root"],
+            config["wifi_attempts"],
+        )
+        html = fetch_portal_html(session, config["portal_root"])
+        status = check_portal_status(session, config["portal_root"])
 
-    verified_status = check_portal_status(session, config["portal_root"])
-    expected_account = build_login_account(config, infer_account_suffix(config, html, verified_status))
-    verified_account = current_portal_account(verified_status)
+    fallback_mode = "interactive"
+    try:
+        login_via_interactive_browser_fallback(config, html, status)
+        time.sleep(3)
+        verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
+        if not portal_result_is_online(verified_status):
+            raise RetryableLoginError("真实浏览器模拟键鼠执行后，校园网门户仍显示离线。")
+        if not account_matches_expected(config, verified_account, expected_account):
+            raise RetryableLoginError(
+                f"真实浏览器模拟键鼠未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
+            )
+    except RetryableLoginError as exc:
+        logging.warning("真实浏览器模拟键鼠兜底失败，将退回无界面浏览器兜底：%s", exc)
+        fallback_mode = "headless"
+        login_via_browser_fallback(config, html, status)
+        time.sleep(3)
+        verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
+
     if not portal_result_is_online(verified_status):
         raise last_error or RetryableLoginError("浏览器兜底已执行完毕，但校园网门户仍显示离线。")
     if not account_matches_expected(config, verified_account, expected_account):
@@ -1112,6 +1307,7 @@ def run_browser_fallback(session: requests.Session, config: dict[str, Any], last
         "account": verified_account or expected_account,
         "already_online": False,
         "used_browser_fallback": True,
+        "browser_fallback_mode": fallback_mode,
         "connectivity_ok": connectivity_ok,
         "connectivity_url": checked_url,
     }
@@ -1231,7 +1427,7 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
             and attempt >= config["browser_fallback_after_attempts"]
         ):
             browser_fallback_tried = True
-            logging.warning("连续 %s 次 HTTP 恢复仍未成功，提前尝试无界面浏览器兜底。", attempt)
+            logging.warning("连续 %s 次 HTTP 恢复仍未成功，提前尝试浏览器兜底。", attempt)
             return run_browser_fallback(session, config, last_error)
 
         if not should_sleep_before_retry:
@@ -1311,7 +1507,10 @@ def main() -> int:
         if result["already_online"]:
             result_message = f"校园网已在线，账号 {account_text} 无需重复认证。"
         elif result["used_browser_fallback"]:
-            result_message = f"校园网已恢复联网，账号 {account_text}，使用了浏览器兜底。"
+            if result.get("browser_fallback_mode") == "interactive":
+                result_message = f"校园网已恢复联网，账号 {account_text}，使用了真实浏览器模拟键鼠兜底。"
+            else:
+                result_message = f"校园网已恢复联网，账号 {account_text}，使用了无界面浏览器兜底。"
         else:
             result_message = f"校园网已恢复联网，账号 {account_text}，未打开浏览器，直接通过 HTTP 认证成功。"
 

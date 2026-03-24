@@ -28,8 +28,8 @@
 - 脚本结束时统一弹出结果通知。
 - 优先使用 Win10/Win11 原生 Toast 通知。
 - Toast 不稳定时再补一个托盘气泡通知。
-- 无界面浏览器兜底能力默认开启，但只在 HTTP 方案连续失败后才触发。
-- ChromeDriver 本地维护默认开启，用于保证无界面浏览器兜底可用。
+- 浏览器兜底会优先使用真实浏览器窗口进行模拟键鼠输入，失败后再退回无界面浏览器方案。
+- ChromeDriver 本地维护默认开启，用于保证浏览器兜底可用。
 
 ## 目录说明
 
@@ -90,7 +90,7 @@
   "wifi_profile": "B132YYDS",
   "notify": true,
   "enable_browser_fallback": true,
-  "browser_fallback_after_attempts": 2,
+  "browser_fallback_after_attempts": 1,
   "post_login_driver_update": true,
   "connectivity_confirm_timeout_seconds": 45,
   "connectivity_check_interval_seconds": 3,
@@ -108,9 +108,9 @@
 - `notify`
   是否启用桌面通知。
 - `browser_fallback_after_attempts`
-  连续多少次 HTTP 恢复失败后，提前切换到无界面浏览器兜底。
+  连续多少次 HTTP 恢复失败后，提前切换到浏览器兜底。默认建议为 `1`。
 - `enable_browser_fallback`
-  是否允许在 HTTP 登录失败后再尝试无界面浏览器兜底。默认开启。
+  是否允许在 HTTP 登录失败后再尝试浏览器兜底。默认开启。
 - `post_login_driver_update`
   是否在联网成功后维护本地 ChromeDriver。默认开启。
 - `max_runtime_seconds`
@@ -207,6 +207,12 @@ powershell -ExecutionPolicy Bypass -File .\register_task.ps1
 - 不要完全关机
 - 允许显示器熄灭
 - 需要省电时用睡眠或休眠，而不是关机
+
+如果你启用了“真实浏览器模拟键鼠优先”这条策略，还需要额外注意：
+
+- 黑屏可以，锁屏和注销不行
+- 必须保留可交互的桌面会话
+- 一旦进入锁屏界面，脚本只能退回 HTTP/无界面浏览器路径，不能真的帮你点界面
 
 ## 常用命令
 
