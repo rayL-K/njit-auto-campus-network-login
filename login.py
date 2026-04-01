@@ -5,17 +5,18 @@
 主流程：
 1. 如果校园网门户不可达，先重连已保存的 Wi-Fi 配置。
 2. 通过 /drcom/chkstatus 查询当前在线状态。
-3. 通过 /drcom/login 直接完成 HTTP 认证，不打开浏览器。
+3. 若未恢复联网，则直接执行浏览器登录流程。
 4. 校验是否为期望账号，并尽可能确认外网连通性。
 5. 在脚本结束时弹出对应结果通知。
 
-Selenium 仅作为可选兜底能力保留，默认关闭。
-ChromeDriver 的本地维护也默认关闭，避免任何不必要的浏览器相关动作。
+浏览器登录会优先尝试真实浏览器窗口交互，必要时再退回无界面浏览器。
+ChromeDriver 的本地维护默认开启，用于保证浏览器登录流程可用。
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -55,7 +56,8 @@ DEFAULT_RETRY_INTERVAL_SECONDS = 15
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS = 45
 DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS = 3
-DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS = 1
+BROWSER_ELEMENT_SEARCH_POLL_INTERVAL_SECONDS = 0.5
+BROWSER_ELEMENT_SEARCH_FRAME_DEPTH = 3
 
 TOAST_ICON_PATHS = {
     "Success": ICON_DIR / "success.svg",
@@ -158,6 +160,12 @@ OPERATOR_SUFFIX_HINTS = {
     "校园其他": "",
     "本科生": "",
 }
+
+
+@dataclass(frozen=True)
+class BrowserElementHandle:
+    frame_path: tuple[int, ...]
+    element: Any
 
 
 class LoginError(RuntimeError):
@@ -291,11 +299,6 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "connectivity_check_interval_seconds",
         DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS,
     )
-    browser_fallback_after_attempts = raw.get(
-        "browser_fallback_after_attempts",
-        DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS,
-    )
-
     try:
         max_runtime_seconds = max(60, int(max_runtime_seconds))
     except (TypeError, ValueError):
@@ -321,11 +324,6 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     except (TypeError, ValueError):
         connectivity_check_interval_seconds = DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS
 
-    try:
-        browser_fallback_after_attempts = max(1, int(browser_fallback_after_attempts))
-    except (TypeError, ValueError):
-        browser_fallback_after_attempts = DEFAULT_BROWSER_FALLBACK_AFTER_ATTEMPTS
-
     return {
         "user_id": user_id,
         "password": password,
@@ -336,8 +334,6 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         "portal_root": portal_root,
         "notify": as_bool(raw.get("notify"), True),
         "post_login_driver_update": as_bool(raw.get("post_login_driver_update"), True),
-        "enable_browser_fallback": as_bool(raw.get("enable_browser_fallback"), True),
-        "browser_fallback_after_attempts": browser_fallback_after_attempts,
         "connectivity_checks": checks,
         "connectivity_confirm_timeout_seconds": connectivity_confirm_timeout_seconds,
         "connectivity_check_interval_seconds": connectivity_check_interval_seconds,
@@ -676,60 +672,6 @@ def is_invalid_credentials_error(payload: dict[str, Any]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
-def login_via_http(
-    session: requests.Session,
-    config: dict[str, Any],
-    html: str,
-    status: dict[str, Any],
-) -> tuple[str, dict[str, Any]]:
-    suffix = infer_account_suffix(config, html, status)
-    account = build_login_account(config, suffix)
-    v4ip = choose_v4ip(status, html)
-    v6ip = choose_v6ip(status, html) or "::"
-    js_version = extract_js_string(html, "fileVersion", "4.X") or "4.X"
-
-    if not v4ip and not v6ip:
-        raise RetryableLoginError("校园网门户页面未提供当前设备 IP，暂时无法发起认证。")
-
-    params = {
-        "callback": "campusLogin",
-        "DDDDD": account,
-        "upass": config["password"],
-        "0MKKey": "123456",
-        "R1": "",
-        "R2": "",
-        "R3": "",
-        "R6": "0",
-        "para": "00",
-        "v4ip": v4ip,
-        "v6ip": v6ip,
-        "terminal_type": "1",
-        "lang": "zh-cn",
-        "jsVersion": js_version,
-    }
-
-    logging.info("准备直接向校园网门户发起 HTTP 认证，账号 %s。", mask_account(account))
-
-    try:
-        response = session.get(
-            f"{config['portal_root']}/drcom/login",
-            params=params,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RetryableLoginError(f"向校园网门户发起 HTTP 认证请求失败：{exc}") from exc
-
-    payload = parse_jsonp_payload(response.text)
-    if portal_result_is_online(payload):
-        return account, payload
-
-    description = describe_login_failure(payload)
-    if is_invalid_credentials_error(payload):
-        raise NonRetryableLoginError(f"校园网门户拒绝了当前账号或密码：{description}")
-    raise RetryableLoginError(f"校园网门户登录未成功：{description}")
-
-
 def logout_via_http(session: requests.Session, config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
     v4ip = choose_v4ip(status, html)
     v6ip = choose_v6ip(status, html)
@@ -973,25 +915,291 @@ def init_browser(headless: bool = True):
         raise RetryableLoginError("；".join(errors)) from exc
 
 
-def find_first_browser_element(wait, locators: list[tuple[Any, str]], clickable: bool = False):
-    from selenium.webdriver.support import expected_conditions as EC
-
-    for locator in locators:
+def wait_for_browser_page_ready(driver, timeout_seconds: float = 15) -> None:
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    while time.monotonic() < deadline:
         try:
-            if clickable:
-                return wait.until(EC.element_to_be_clickable(locator))
-            return wait.until(EC.visibility_of_element_located(locator))
+            ready_state = str(driver.execute_script("return document.readyState || 'loading';")).strip().lower()
+            if ready_state in {"interactive", "complete"}:
+                return
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+
+def switch_to_browser_frame_path(driver, frame_path: tuple[int, ...]) -> None:
+    from selenium.webdriver.common.by import By
+
+    driver.switch_to.default_content()
+    for index in frame_path:
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+        if index >= len(frames):
+            raise RetryableLoginError(f"浏览器页面结构已变化，无法切换到 iframe 路径 {frame_path!r}。")
+        driver.switch_to.frame(frames[index])
+
+
+def collect_browser_frame_paths(
+    driver,
+    prefix: tuple[int, ...] = (),
+    depth: int = 0,
+    max_depth: int = BROWSER_ELEMENT_SEARCH_FRAME_DEPTH,
+) -> list[tuple[int, ...]]:
+    from selenium.webdriver.common.by import By
+
+    paths = [prefix]
+    if depth >= max_depth:
+        return paths
+
+    try:
+        frame_count = len(driver.find_elements(By.CSS_SELECTOR, "iframe, frame"))
+    except Exception:
+        return paths
+
+    for index in range(frame_count):
+        try:
+            frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+            if index >= len(frames):
+                break
+            driver.switch_to.frame(frames[index])
         except Exception:
             continue
+
+        try:
+            paths.extend(collect_browser_frame_paths(driver, prefix + (index,), depth + 1, max_depth))
+        finally:
+            try:
+                driver.switch_to.parent_frame()
+            except Exception:
+                switch_to_browser_frame_path(driver, prefix)
+
+    return paths
+
+
+def browser_element_is_usable(element, clickable: bool = False) -> bool:
+    try:
+        if not element.is_displayed():
+            return False
+        if clickable and not element.is_enabled():
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def find_browser_element_by_heuristic(driver, role: str, clickable: bool = False):
+    return driver.execute_script(
+        """
+        const role = arguments[0];
+        const requireEnabled = arguments[1];
+
+        function attr(el, name) {
+            return (el.getAttribute(name) || '').toLowerCase();
+        }
+
+        function blob(el) {
+            return [
+                el.id || '',
+                el.name || '',
+                el.className || '',
+                attr(el, 'type'),
+                attr(el, 'placeholder'),
+                attr(el, 'aria-label'),
+                attr(el, 'title'),
+                attr(el, 'value'),
+                (el.innerText || el.textContent || ''),
+            ].join(' ').toLowerCase();
+        }
+
+        function visible(el) {
+            if (!el || typeof el.getBoundingClientRect !== 'function') {
+                return false;
+            }
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === 'none' || style.visibility === 'hidden') {
+                return false;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.width >= 3 && rect.height >= 3;
+        }
+
+        function enabled(el) {
+            return !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+        }
+
+        function formHasPassword(el) {
+            const form = el.form || el.closest('form');
+            return !!(form && form.querySelector('input[type="password"]'));
+        }
+
+        function containsAny(text, words) {
+            return words.some((word) => text.includes(word));
+        }
+
+        function score(el) {
+            const text = blob(el);
+            const tag = (el.tagName || '').toLowerCase();
+            const type = attr(el, 'type');
+            let value = 0;
+
+            if (role === 'account') {
+                if (tag === 'input' || tag === 'textarea') {
+                    value += 15;
+                }
+                if (type === '' || ['text', 'tel', 'number', 'email', 'search'].includes(type)) {
+                    value += 20;
+                }
+                if (['hidden', 'password', 'submit', 'button', 'radio', 'checkbox'].includes(type)) {
+                    value -= 80;
+                }
+                if (text.includes('ddddd')) {
+                    value += 200;
+                }
+                if (formHasPassword(el)) {
+                    value += 30;
+                }
+                if (containsAny(text, ['account', 'user', 'login', 'uid', 'userid', 'username', 'student', 'number', '学号', '账号', '帐号', '用户名'])) {
+                    value += 60;
+                }
+            } else if (role === 'password') {
+                if (tag === 'input') {
+                    value += 15;
+                }
+                if (type === 'password') {
+                    value += 200;
+                }
+                if (containsAny(text, ['password', 'pass', 'upass', 'pwd', '密码', '口令'])) {
+                    value += 60;
+                }
+                if (formHasPassword(el)) {
+                    value += 20;
+                }
+            } else if (role === 'login') {
+                if (['button', 'input', 'a'].includes(tag) || attr(el, 'role') === 'button') {
+                    value += 10;
+                }
+                if (type === 'submit') {
+                    value += 120;
+                }
+                if (type === 'button') {
+                    value += 40;
+                }
+                if (containsAny(text, ['0mkkey', 'login', 'signin', 'submit', 'connect', '认证', '登录', '上网', '联网', '连接'])) {
+                    value += 100;
+                }
+                if (formHasPassword(el)) {
+                    value += 25;
+                }
+            } else if (role === 'logout') {
+                if (['button', 'input', 'a'].includes(tag) || attr(el, 'role') === 'button') {
+                    value += 10;
+                }
+                if (type === 'submit' || type === 'button') {
+                    value += 20;
+                }
+                if (containsAny(text, ['logout', 'signout', 'disconnect', '注销', '下线', '退出', '断开'])) {
+                    value += 100;
+                }
+            }
+
+            return value;
+        }
+
+        const selectors = {
+            account: 'input, textarea',
+            password: 'input',
+            login: 'input, button, a, [role="button"]',
+            logout: 'input, button, a, [role="button"]',
+        };
+
+        const candidates = Array.from(document.querySelectorAll(selectors[role] || '*'))
+            .filter((el) => visible(el) && (!requireEnabled || enabled(el)))
+            .map((el) => ({ el, score: score(el) }))
+            .filter((item) => item.score > 0)
+            .sort((left, right) => right.score - left.score);
+
+        return candidates.length ? candidates[0].el : null;
+        """,
+        role,
+        clickable,
+    )
+
+
+def find_first_browser_element_in_current_context(
+    driver,
+    locators: list[tuple[Any, str]],
+    clickable: bool = False,
+    heuristic: str | None = None,
+):
+    for locator in locators:
+        try:
+            elements = driver.find_elements(*locator)
+        except Exception:
+            continue
+
+        for element in elements:
+            if browser_element_is_usable(element, clickable):
+                return element
+
+    if heuristic:
+        try:
+            candidate = find_browser_element_by_heuristic(driver, heuristic, clickable)
+        except Exception:
+            candidate = None
+        if candidate is not None and browser_element_is_usable(candidate, clickable):
+            return candidate
+
     return None
 
 
-def activate_browser_window(driver) -> bool:
+def find_first_browser_element(
+    driver,
+    timeout_seconds: float,
+    locators: list[tuple[Any, str]],
+    clickable: bool = False,
+    description: str = "元素",
+    heuristic: str | None = None,
+) -> BrowserElementHandle | None:
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    checked_paths: list[tuple[int, ...]] = []
+
+    while time.monotonic() < deadline:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        checked_paths = collect_browser_frame_paths(driver)
+        for frame_path in checked_paths:
+            try:
+                switch_to_browser_frame_path(driver, frame_path)
+            except Exception:
+                continue
+
+            element = find_first_browser_element_in_current_context(
+                driver,
+                locators,
+                clickable=clickable,
+                heuristic=heuristic,
+            )
+            if element is not None:
+                return BrowserElementHandle(frame_path=frame_path, element=element)
+
+        time.sleep(BROWSER_ELEMENT_SEARCH_POLL_INTERVAL_SECONDS)
+
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    logging.debug("未能在浏览器页面中找到%s，已检查 iframe 路径：%s", description, checked_paths or [()])
+    return None
+
+
+def find_matching_browser_window(driver):
     try:
         import pygetwindow as gw
     except Exception as exc:
         logging.warning("未能加载窗口激活组件，将继续尝试默认前台窗口：%s", exc)
-        return False
+        return None
 
     rect = driver.get_window_rect()
     candidates = []
@@ -1022,10 +1230,17 @@ def activate_browser_window(driver) -> bool:
         candidates = [window for window in gw.getWindowsWithTitle("Chrome") if window.title]
 
     if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: max(1, item.width) * max(1, item.height))
+
+
+def activate_browser_window(driver) -> bool:
+    target = find_matching_browser_window(driver)
+    if target is None:
         logging.warning("未找到可激活的 Chrome 窗口，将继续尝试默认前台输入。")
         return False
 
-    target = max(candidates, key=lambda item: max(1, item.width) * max(1, item.height))
     try:
         if target.isMinimized:
             target.restore()
@@ -1041,26 +1256,134 @@ def activate_browser_window(driver) -> bool:
         return False
 
 
-def get_browser_element_screen_center(driver, element) -> tuple[int, int]:
+def switch_to_browser_element(driver, handle: BrowserElementHandle):
+    switch_to_browser_frame_path(driver, handle.frame_path)
+    return handle.element
+
+
+def get_browser_element_screen_center(driver, handle: BrowserElementHandle) -> tuple[int, int]:
+    element = switch_to_browser_element(driver, handle)
     metrics = driver.execute_script(
         """
         const target = arguments[0];
         target.scrollIntoView({block: 'center', inline: 'center'});
         const rect = target.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        const borderX = (window.outerWidth - window.innerWidth) / 2;
-        const borderY = window.outerHeight - window.innerHeight;
+        let left = rect.left;
+        let top = rect.top;
+        let rootWindow = window;
+
+        try {
+            let currentWindow = window;
+            while (currentWindow !== currentWindow.parent && currentWindow.frameElement) {
+                const frameRect = currentWindow.frameElement.getBoundingClientRect();
+                left += frameRect.left;
+                top += frameRect.top;
+                currentWindow = currentWindow.parent;
+            }
+            rootWindow = currentWindow;
+        } catch (error) {
+            rootWindow = window;
+        }
+
         return {
-            x: (window.screenX + borderX + rect.left + (rect.width / 2)) * dpr,
-            y: (window.screenY + borderY + rect.top + (rect.height / 2)) * dpr,
+            centerX: Math.max(((rootWindow.outerWidth - rootWindow.innerWidth) / 2), 0) + left + (rect.width / 2),
+            centerY: Math.max((rootWindow.outerHeight - rootWindow.innerHeight - ((rootWindow.outerWidth - rootWindow.innerWidth) / 2)), 0) + top + (rect.height / 2),
+            outerWidth: Math.max(rootWindow.outerWidth || 0, 1),
+            outerHeight: Math.max(rootWindow.outerHeight || 0, 1),
         };
         """,
         element,
     )
-    return int(round(metrics["x"])), int(round(metrics["y"]))
+
+    window = find_matching_browser_window(driver)
+    if window is not None:
+        window_left = window.left
+        window_top = window.top
+        window_width = max(1, window.width)
+        window_height = max(1, window.height)
+    else:
+        rect = driver.get_window_rect()
+        window_left = rect["x"]
+        window_top = rect["y"]
+        window_width = max(1, rect["width"])
+        window_height = max(1, rect["height"])
+
+    scale_x = window_width / max(1.0, float(metrics["outerWidth"]))
+    scale_y = window_height / max(1.0, float(metrics["outerHeight"]))
+    return (
+        int(round(window_left + (float(metrics["centerX"]) * scale_x))),
+        int(round(window_top + (float(metrics["centerY"]) * scale_y))),
+    )
 
 
-def click_and_type_via_os_input(driver, element, text: str) -> None:
+def browser_handles_reference_same_element(
+    driver,
+    first: BrowserElementHandle,
+    second: BrowserElementHandle,
+) -> bool:
+    if first.frame_path != second.frame_path:
+        return False
+
+    try:
+        switch_to_browser_frame_path(driver, first.frame_path)
+        return bool(driver.execute_script("return arguments[0] === arguments[1];", first.element, second.element))
+    except Exception:
+        return first.element == second.element
+
+
+def set_browser_input_value(driver, handle: BrowserElementHandle, text: str) -> None:
+    element = switch_to_browser_element(driver, handle)
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+        element.click()
+        element.clear()
+        element.send_keys(text)
+        return
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script(
+            """
+            const target = arguments[0];
+            const value = arguments[1];
+            target.scrollIntoView({block: 'center', inline: 'center'});
+            target.focus();
+            if ('value' in target) {
+                target.value = value;
+            }
+            target.dispatchEvent(new Event('input', {bubbles: true}));
+            target.dispatchEvent(new Event('change', {bubbles: true}));
+            """,
+            element,
+            text,
+        )
+    except Exception as exc:
+        raise RetryableLoginError(f"浏览器已找到输入框，但填充内容失败：{exc}") from exc
+
+
+def click_browser_element(driver, handle: BrowserElementHandle) -> None:
+    element = switch_to_browser_element(driver, handle)
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+        element.click()
+        return
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script(
+            """
+            arguments[0].scrollIntoView({block: 'center', inline: 'center'});
+            arguments[0].click();
+            """,
+            element,
+        )
+    except Exception as exc:
+        raise RetryableLoginError(f"浏览器已找到按钮，但触发点击失败：{exc}") from exc
+
+
+def click_and_type_via_os_input(driver, handle: BrowserElementHandle, text: str) -> None:
     try:
         import pyautogui
     except Exception as exc:
@@ -1068,7 +1391,7 @@ def click_and_type_via_os_input(driver, element, text: str) -> None:
 
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0.15
-    center_x, center_y = get_browser_element_screen_center(driver, element)
+    center_x, center_y = get_browser_element_screen_center(driver, handle)
     pyautogui.click(center_x, center_y)
     time.sleep(0.2)
     pyautogui.hotkey("ctrl", "a")
@@ -1076,7 +1399,7 @@ def click_and_type_via_os_input(driver, element, text: str) -> None:
     pyautogui.write(text, interval=0.03)
 
 
-def click_via_os_input(driver, element) -> None:
+def click_via_os_input(driver, handle: BrowserElementHandle) -> None:
     try:
         import pyautogui
     except Exception as exc:
@@ -1084,89 +1407,396 @@ def click_via_os_input(driver, element) -> None:
 
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0.15
-    center_x, center_y = get_browser_element_screen_center(driver, element)
+    center_x, center_y = get_browser_element_screen_center(driver, handle)
     pyautogui.click(center_x, center_y)
 
 
-def set_browser_operator(driver, operator: str, suffix: str) -> bool:
+def find_browser_operator_candidate(driver, operator: str, suffix: str, mode: str = "option"):
+    return driver.execute_script(
+        """
+        const operator = (arguments[0] || '').trim().toLowerCase();
+        const suffix = (arguments[1] || '').trim().toLowerCase();
+        const mode = (arguments[2] || 'option').trim().toLowerCase();
+
+        function attr(el, name) {
+            return (el.getAttribute(name) || '').trim().toLowerCase();
+        }
+
+        function textBlob(el) {
+            return [
+                el.innerText || '',
+                el.textContent || '',
+                el.value || '',
+                attr(el, 'aria-label'),
+                attr(el, 'title'),
+                attr(el, 'placeholder'),
+                attr(el, 'data-value'),
+                attr(el, 'data-name'),
+            ].join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+        }
+
+        function visible(el) {
+            if (!el || typeof el.getBoundingClientRect !== 'function') {
+                return false;
+            }
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === 'none' || style.visibility === 'hidden') {
+                return false;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.width >= 3 && rect.height >= 3;
+        }
+
+        function enabled(el) {
+            return !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+        }
+
+        function clickable(el) {
+            const tag = (el.tagName || '').toLowerCase();
+            const role = attr(el, 'role');
+            return ['button', 'a', 'label', 'summary', 'option', 'select'].includes(tag)
+                || ['button', 'option', 'radio', 'combobox', 'tab'].includes(role)
+                || attr(el, 'aria-haspopup') === 'listbox'
+                || typeof el.onclick === 'function';
+        }
+
+        function containsAny(text, words) {
+            return words.some((word) => word && text.includes(word));
+        }
+
+        const operatorHints = [operator, suffix].filter(Boolean);
+        const knownOperatorWords = ['中国移动', '中国联通', '中国电信', '移动', '联通', '电信', 'cmcc', 'lt', 'dx', '校园网', '校园用户'];
+        const triggerWords = ['运营商', '接入方式', '网络类型', '上网方式', '宽带', '用户类型'];
+        const selector = "input, button, a, label, div, span, li, td, select, option, [role='button'], [role='option'], [role='radio'], [role='combobox'], [aria-haspopup='listbox']";
+
+        function score(el) {
+            const tag = (el.tagName || '').toLowerCase();
+            const role = attr(el, 'role');
+            const text = textBlob(el);
+            let value = 0;
+
+            if (mode === 'option') {
+                if (!clickable(el) && tag !== 'option') {
+                    return -1;
+                }
+                if (operatorHints.some((hint) => hint && text === hint)) {
+                    value += 260;
+                }
+                if (operatorHints.some((hint) => hint && text.includes(hint))) {
+                    value += 220;
+                }
+                if (suffix && [attr(el, 'value'), attr(el, 'data-value')].includes(suffix)) {
+                    value += 260;
+                }
+                if (['option', 'li', 'label', 'button', 'a'].includes(tag) || ['option', 'radio', 'button'].includes(role)) {
+                    value += 40;
+                }
+                if (containsAny(text, triggerWords)) {
+                    value -= 120;
+                }
+                return value;
+            }
+
+            if (!clickable(el)) {
+                return -1;
+            }
+            if (containsAny(text, triggerWords)) {
+                value += 180;
+            }
+            if (containsAny(text, knownOperatorWords)) {
+                value += 40;
+            }
+            if (operatorHints.some((hint) => hint && text.includes(hint))) {
+                value += 15;
+            }
+            if (role === 'combobox' || attr(el, 'aria-haspopup') === 'listbox' || tag === 'select') {
+                value += 50;
+            }
+            return value;
+        }
+
+        const candidates = Array.from(document.querySelectorAll(selector))
+            .filter((el) => visible(el) && enabled(el))
+            .map((el) => ({ el, score: score(el) }))
+            .filter((item) => item.score > 0)
+            .sort((left, right) => right.score - left.score);
+
+        return candidates.length ? candidates[0].el : null;
+        """,
+        operator,
+        suffix,
+        mode,
+    )
+
+
+def click_browser_candidate(driver, frame_path: tuple[int, ...], element: Any, allow_os_click: bool = False) -> None:
+    handle = BrowserElementHandle(frame_path=frame_path, element=element)
+    try:
+        click_browser_element(driver, handle)
+        return
+    except RetryableLoginError:
+        if not allow_os_click:
+            raise
+
+    activate_browser_window(driver)
+    click_via_os_input(driver, handle)
+
+
+def set_browser_operator(
+    driver,
+    operator: str,
+    suffix: str,
+    preferred_frame_path: tuple[int, ...] = (),
+    allow_os_click: bool = False,
+) -> bool:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import Select
 
-    select_elements = driver.find_elements(By.NAME, "ISP_select")
-    if not select_elements:
-        select_elements = driver.find_elements(By.XPATH, "//*[@id='edit_body']//select")
+    frame_paths = [preferred_frame_path]
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+    for frame_path in collect_browser_frame_paths(driver):
+        if frame_path not in frame_paths:
+            frame_paths.append(frame_path)
 
-    if select_elements:
-        selector = Select(select_elements[0])
-        if suffix:
-            for option in selector.options:
-                if option.get_attribute("value") == suffix:
-                    selector.select_by_value(suffix)
-                    return True
-        if operator:
-            for option in selector.options:
-                if option.text.strip() == operator:
-                    selector.select_by_visible_text(operator)
-                    return True
+    for frame_path in frame_paths:
+        try:
+            switch_to_browser_frame_path(driver, frame_path)
+        except Exception:
+            continue
 
-    radio_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='radio']")
-    for radio in radio_inputs:
-        if suffix and radio.get_attribute("value") == suffix:
-            if not radio.is_selected():
-                radio.click()
+        select_elements = driver.find_elements(By.CSS_SELECTOR, "select")
+        for select_element in select_elements:
+            if not browser_element_is_usable(select_element):
+                continue
+
+            try:
+                selector = Select(select_element)
+            except Exception:
+                continue
+
+            if suffix:
+                for option in selector.options:
+                    value = (option.get_attribute("value") or "").strip()
+                    if value == suffix:
+                        selector.select_by_value(value)
+                        return True
+            if operator:
+                for option in selector.options:
+                    option_text = option.text.strip()
+                    if option_text == operator or operator in option_text:
+                        selector.select_by_visible_text(option_text)
+                        return True
+
+        radio_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='radio']")
+        for radio in radio_inputs:
+            if not browser_element_is_usable(radio, clickable=True):
+                continue
+
+            label_text = " ".join(
+                filter(
+                    None,
+                    [
+                        radio.get_attribute("value"),
+                        radio.get_attribute("title"),
+                        radio.get_attribute("aria-label"),
+                    ],
+                )
+            )
+            radio_id = (radio.get_attribute("id") or "").strip()
+            if radio_id:
+                try:
+                    labels = driver.find_elements(By.CSS_SELECTOR, f"label[for='{radio_id}']")
+                    label_text = " ".join(filter(None, [label_text, *[item.text.strip() for item in labels if item.text.strip()]]))
+                except Exception:
+                    pass
+
+            if suffix and suffix == (radio.get_attribute("value") or "").strip():
+                if not radio.is_selected():
+                    click_browser_candidate(driver, frame_path, radio, allow_os_click=allow_os_click)
+                return True
+            if operator and operator in label_text:
+                if not radio.is_selected():
+                    click_browser_candidate(driver, frame_path, radio, allow_os_click=allow_os_click)
+                return True
+
+        custom_option = find_browser_operator_candidate(driver, operator, suffix, mode="option")
+        if custom_option is not None and browser_element_is_usable(custom_option, clickable=True):
+            click_browser_candidate(driver, frame_path, custom_option, allow_os_click=allow_os_click)
             return True
-        if operator and operator in (radio.get_attribute("title") or ""):
-            if not radio.is_selected():
-                radio.click()
-            return True
+
+        custom_trigger = find_browser_operator_candidate(driver, operator, suffix, mode="trigger")
+        if custom_trigger is not None and browser_element_is_usable(custom_trigger, clickable=True):
+            click_browser_candidate(driver, frame_path, custom_trigger, allow_os_click=allow_os_click)
+            time.sleep(0.5)
+            custom_option = find_browser_operator_candidate(driver, operator, suffix, mode="option")
+            if custom_option is not None and browser_element_is_usable(custom_option, clickable=True):
+                click_browser_candidate(driver, frame_path, custom_option, allow_os_click=allow_os_click)
+                return True
 
     return False
 
 
-def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
+def get_browser_login_form_locators() -> dict[str, list[tuple[Any, str]]]:
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
 
+    lowered = "translate(%s,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
+
+    account_locators = [
+        (By.NAME, "DDDDD"),
+        (By.ID, "DDDDD"),
+        (By.CSS_SELECTOR, "input[name='DDDDD'], input#DDDDD"),
+        (By.XPATH, "//*[@id='edit_body']//input[@name='DDDDD']"),
+        (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[2]"),
+        (
+            By.XPATH,
+            "//input[not(@type='hidden') and ("
+            + "contains("
+            + lowered % "@name"
+            + ",'ddddd') or contains("
+            + lowered % "@name"
+            + ",'user') or contains("
+            + lowered % "@name"
+            + ",'account') or contains("
+            + lowered % "@name"
+            + ",'login') or contains("
+            + lowered % "@name"
+            + ",'uid') or contains("
+            + lowered % "@id"
+            + ",'ddddd') or contains("
+            + lowered % "@id"
+            + ",'user') or contains("
+            + lowered % "@id"
+            + ",'account') or contains("
+            + lowered % "@id"
+            + ",'login') or contains("
+            + lowered % "@id"
+            + ",'uid') or contains(@placeholder,'学号') or contains(@placeholder,'账号') or contains(@placeholder,'用户名') or contains(@aria-label,'学号') or contains(@aria-label,'账号') or contains(@aria-label,'用户名'))]",
+        ),
+        (
+            By.XPATH,
+            "//form[.//input[@type='password']]//*[self::input or self::textarea]"
+            "[not(@type='hidden') and not(@type='password') and not(@type='submit') and not(@type='button')][1]",
+        ),
+    ]
+
+    password_locators = [
+        (By.NAME, "upass"),
+        (By.ID, "upass"),
+        (By.CSS_SELECTOR, "input[name='upass'], input#upass, input[type='password']"),
+        (By.XPATH, "//*[@id='edit_body']//input[@name='upass']"),
+        (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[3]"),
+        (By.XPATH, "//input[@type='password']"),
+        (
+            By.XPATH,
+            "//input[contains("
+            + lowered % "@name"
+            + ",'pass') or contains("
+            + lowered % "@name"
+            + ",'pwd') or contains("
+            + lowered % "@id"
+            + ",'pass') or contains("
+            + lowered % "@id"
+            + ",'pwd') or contains(@placeholder,'密码') or contains(@aria-label,'密码')]",
+        ),
+    ]
+
+    login_button_locators = [
+        (By.NAME, "0MKKey"),
+        (By.ID, "0MKKey"),
+        (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[1]"),
+        (By.CSS_SELECTOR, "input[name='0MKKey'], input#0MKKey"),
+        (By.XPATH, "//input[@type='submit']"),
+        (By.XPATH, "//button[@type='submit']"),
+        (
+            By.XPATH,
+            "//input[contains("
+            + lowered % "@value"
+            + ",'login') or contains("
+            + lowered % "@value"
+            + ",'connect') or contains(@value,'登录') or contains(@value,'认证') or contains(@value,'上网') or contains(@value,'连接')]",
+        ),
+        (
+            By.XPATH,
+            "//button[contains("
+            + lowered % "normalize-space(.)"
+            + ",'login') or contains("
+            + lowered % "normalize-space(.)"
+            + ",'connect') or contains(normalize-space(.),'登录') or contains(normalize-space(.),'认证') or contains(normalize-space(.),'上网') or contains(normalize-space(.),'连接')]",
+        ),
+        (
+            By.XPATH,
+            "//form[.//input[@type='password']]//*[self::button or self::input][@type='submit' or @type='button'][1]",
+        ),
+    ]
+
+    logout_button_locators = [
+        (By.NAME, "logout"),
+        (By.ID, "logout"),
+        (By.CSS_SELECTOR, "input[name='logout'], input#logout"),
+        (By.XPATH, "//input[@type='button' and contains(@value,'销')]"),
+        (By.XPATH, "//input[contains(" + lowered % "@value" + ",'logout') or contains(@value,'注销') or contains(@value,'下线')]"),
+        (
+            By.XPATH,
+            "//button[contains("
+            + lowered % "normalize-space(.)"
+            + ",'logout') or contains(normalize-space(.),'注销') or contains(normalize-space(.),'下线') or contains(normalize-space(.),'退出')]",
+        ),
+    ]
+
+    return {
+        "account": account_locators,
+        "password": password_locators,
+        "login": login_button_locators,
+        "logout": logout_button_locators,
+    }
+
+
+def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
     suffix = infer_account_suffix(config, html, status)
     account_input_value = build_login_account(config, suffix)
+    locators = get_browser_login_form_locators()
 
     driver = init_browser(headless=False)
     try:
         driver.set_window_rect(80, 60, 1280, 900)
         driver.get(f"{config['portal_root']}/")
-        wait = WebDriverWait(driver, 20)
-        time.sleep(3)
+        wait_for_browser_page_ready(driver, 20)
+        time.sleep(1)
         activate_browser_window(driver)
 
-        id_locators = [
-            (By.NAME, "DDDDD"),
-            (By.XPATH, "//*[@id='edit_body']//input[@name='DDDDD']"),
-            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[2]"),
-        ]
-        password_locators = [
-            (By.NAME, "upass"),
-            (By.XPATH, "//*[@id='edit_body']//input[@name='upass']"),
-            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[3]"),
-        ]
-        login_button_locators = [
-            (By.NAME, "0MKKey"),
-            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[1]"),
-        ]
-        logout_button_locators = [
-            (By.NAME, "logout"),
-            (By.CSS_SELECTOR, "input[name='logout']"),
-            (By.XPATH, "//input[@type='button' and contains(@value,'销')]"),
-        ]
-
-        id_input = find_first_browser_element(wait, id_locators)
+        id_input = find_first_browser_element(
+            driver,
+            20,
+            locators["account"],
+            description="账号输入框",
+            heuristic="account",
+        )
 
         if id_input is None:
-            logout_button = find_first_browser_element(wait, logout_button_locators, clickable=True)
+            logout_button = find_first_browser_element(
+                driver,
+                8,
+                locators["logout"],
+                clickable=True,
+                description="注销按钮",
+                heuristic="logout",
+            )
             if logout_button is not None:
                 logging.info("真实浏览器当前处于注销页，先模拟点击注销按钮。")
                 click_via_os_input(driver, logout_button)
                 time.sleep(5)
-                id_input = find_first_browser_element(wait, id_locators)
+                wait_for_browser_page_ready(driver, 20)
+                activate_browser_window(driver)
+                id_input = find_first_browser_element(
+                    driver,
+                    20,
+                    locators["account"],
+                    description="账号输入框",
+                    heuristic="account",
+                )
 
         if id_input is None:
             page_title = ""
@@ -1176,19 +1806,45 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
                 page_title = ""
             raise RetryableLoginError(f"真实浏览器键鼠兜底未发现登录表单。当前页面标题：{page_title or '<空>'}")
 
-        password_input = find_first_browser_element(wait, password_locators)
+        if set_browser_operator(
+            driver,
+            config["operator"],
+            suffix,
+            preferred_frame_path=id_input.frame_path,
+            allow_os_click=True,
+        ):
+            logging.info("浏览器兜底已自动选择运营商 %s。", config["operator"])
+
+        password_input = find_first_browser_element(
+            driver,
+            20,
+            locators["password"],
+            description="密码输入框",
+            heuristic="password",
+        )
 
         if password_input is None:
             raise RetryableLoginError("真实浏览器键鼠兜底未找到密码输入框。")
 
-        login_button = find_first_browser_element(wait, login_button_locators, clickable=True)
+        if browser_handles_reference_same_element(driver, id_input, password_input):
+            raise RetryableLoginError("浏览器兜底识别到账号输入框和密码输入框是同一个元素，已停止填写以避免把账号密码都输入到同一输入框。")
+
+        login_button = find_first_browser_element(
+            driver,
+            20,
+            locators["login"],
+            clickable=True,
+            description="登录按钮",
+            heuristic="login",
+        )
 
         if login_button is None:
             raise RetryableLoginError("真实浏览器键鼠兜底未找到登录按钮。")
 
-        logging.info("开始执行真实浏览器模拟键鼠兜底。")
-        click_and_type_via_os_input(driver, id_input, account_input_value)
-        click_and_type_via_os_input(driver, password_input, config["password"])
+        logging.info("开始执行真实浏览器混合兜底：输入框走 DOM 填值，按钮保留真实点击。")
+        set_browser_input_value(driver, id_input, account_input_value)
+        set_browser_input_value(driver, password_input, config["password"])
+        activate_browser_window(driver)
         click_via_os_input(driver, login_button)
         time.sleep(5)
     finally:
@@ -1196,50 +1852,60 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
 
 
 def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-
     suffix = infer_account_suffix(config, html, status)
     account_input_value = build_login_account(config, suffix)
+    locators = get_browser_login_form_locators()
 
     driver = init_browser(headless=True)
     try:
         driver.get(f"{config['portal_root']}/")
-        wait = WebDriverWait(driver, 20)
-        time.sleep(3)
+        wait_for_browser_page_ready(driver, 20)
+        time.sleep(1)
 
-        id_input = find_first_browser_element(wait, [
-            (By.NAME, "DDDDD"),
-            (By.XPATH, "//*[@id='edit_body']//input[@name='DDDDD']"),
-            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[2]"),
-        ])
+        id_input = find_first_browser_element(
+            driver,
+            20,
+            locators["account"],
+            description="账号输入框",
+            heuristic="account",
+        )
 
         if id_input is None:
             logging.info("无界面浏览器兜底未发现登录表单，校园网门户可能已经在线。")
             return
 
-        password_input = find_first_browser_element(wait, [
-            (By.NAME, "upass"),
-            (By.XPATH, "//*[@id='edit_body']//input[@name='upass']"),
-            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[3]"),
-        ])
+        if set_browser_operator(driver, config["operator"], suffix, preferred_frame_path=id_input.frame_path):
+            logging.info("无界面浏览器兜底已自动选择运营商 %s。", config["operator"])
+
+        password_input = find_first_browser_element(
+            driver,
+            20,
+            locators["password"],
+            description="密码输入框",
+            heuristic="password",
+        )
 
         if password_input is None:
             raise RetryableLoginError("无界面浏览器兜底未找到密码输入框。")
 
-        login_button = find_first_browser_element(wait, [
-            (By.NAME, "0MKKey"),
-            (By.XPATH, "//*[@id='edit_body']/div[3]/div[2]/form/input[1]"),
-        ], clickable=True)
+        if browser_handles_reference_same_element(driver, id_input, password_input):
+            raise RetryableLoginError("浏览器兜底识别到账号输入框和密码输入框是同一个元素，已停止填写以避免误填。")
+
+        login_button = find_first_browser_element(
+            driver,
+            20,
+            locators["login"],
+            clickable=True,
+            description="登录按钮",
+            heuristic="login",
+        )
 
         if login_button is None:
             raise RetryableLoginError("无界面浏览器兜底未找到登录按钮。")
 
-        id_input.clear()
-        id_input.send_keys(account_input_value)
-        password_input.clear()
-        password_input.send_keys(config["password"])
-        login_button.click()
+        set_browser_input_value(driver, id_input, account_input_value)
+        set_browser_input_value(driver, password_input, config["password"])
+        click_browser_element(driver, login_button)
         time.sleep(5)
     finally:
         driver.quit()
@@ -1253,7 +1919,7 @@ def verify_portal_login_result(session: requests.Session, config: dict[str, Any]
 
 
 def run_browser_fallback(session: requests.Session, config: dict[str, Any], last_error: LoginError | None) -> dict[str, Any]:
-    logging.warning("直接 HTTP 认证未成功，将尝试真实浏览器模拟键鼠兜底。")
+    logging.info("将执行浏览器登录流程。")
     if not portal_is_reachable(session, config["portal_root"]):
         connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
 
@@ -1340,51 +2006,22 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
                 "connectivity_ok": True,
                 "connectivity_url": checked_url,
             }
-        
-        logging.warning("校园网显示已在线，但外网检测不通（假死状态）。执行注销重连。")
-        logout_via_http(session, config, html, status)
-        time.sleep(2)
 
-    if portal_result_is_online(status) and current_account:
+        logging.warning("校园网显示已在线，但外网检测不通（假死状态）。改用浏览器重新认证。")
+
+    elif portal_result_is_online(status) and current_account:
         logging.warning(
-            "校园网门户显示已有在线会话：%s。尝试执行注销扫清障碍。",
+            "校园网门户显示已有在线会话：%s。将改用浏览器重新认证。",
             current_account,
         )
-        logout_via_http(session, config, html, status)
-        time.sleep(2)
 
-    account, _ = login_via_http(session, config, html, status)
-    time.sleep(3)
-
-    verified_status = check_portal_status(session, config["portal_root"])
-    verified_account = current_portal_account(verified_status)
-    if not portal_result_is_online(verified_status):
-        raise RetryableLoginError("HTTP 认证请求已发送，但校园网门户仍显示离线。")
-    if not account_matches_expected(config, verified_account, account):
-        raise RetryableLoginError(
-            f"校园网门户已显示在线，但当前账号为 {verified_account or '<未知>'}，与期望账号不一致。"
-        )
-
-    connectivity_ok, checked_url = check_external_connectivity(
-        session,
-        config["connectivity_checks"],
-        config["connectivity_confirm_timeout_seconds"],
-        config["connectivity_check_interval_seconds"],
-    )
-    return {
-        "account": verified_account or account,
-        "already_online": False,
-        "used_browser_fallback": False,
-        "connectivity_ok": connectivity_ok,
-        "connectivity_url": checked_url,
-    }
+    return run_browser_fallback(session, config, None)
 
 
 def run_login_flow(session: requests.Session, config: dict[str, Any], notify_enabled: bool) -> dict[str, Any]:
     deadline = time.time() + config["max_runtime_seconds"]
     attempt = 0
     last_error: LoginError | None = None
-    browser_fallback_tried = False
 
     while time.time() < deadline:
         attempt += 1
@@ -1421,24 +2058,12 @@ def run_login_flow(session: requests.Session, config: dict[str, Any], notify_ena
             last_error = exc
             logging.warning("第 %s 次登录尝试失败：%s", attempt, exc)
 
-        if (
-            config["enable_browser_fallback"]
-            and not browser_fallback_tried
-            and attempt >= config["browser_fallback_after_attempts"]
-        ):
-            browser_fallback_tried = True
-            logging.warning("连续 %s 次 HTTP 恢复仍未成功，提前尝试浏览器兜底。", attempt)
-            return run_browser_fallback(session, config, last_error)
-
         if not should_sleep_before_retry:
             continue
 
         if time.time() + config["retry_interval_seconds"] >= deadline:
             break
         time.sleep(config["retry_interval_seconds"])
-
-    if config["enable_browser_fallback"] and not browser_fallback_tried:
-        return run_browser_fallback(session, config, last_error)
 
     raise last_error or RetryableLoginError("在设定的重试时间窗口内，校园网认证仍未成功。")
 
@@ -1512,7 +2137,7 @@ def main() -> int:
             else:
                 result_message = f"校园网已恢复联网，账号 {account_text}，使用了无界面浏览器兜底。"
         else:
-            result_message = f"校园网已恢复联网，账号 {account_text}，未打开浏览器，直接通过 HTTP 认证成功。"
+            result_message = f"校园网已恢复联网，账号 {account_text}。"
 
         if result["connectivity_ok"]:
             result_message = f"{result_message} 外网连通性已确认。"
@@ -1524,12 +2149,7 @@ def main() -> int:
         result_title = "校园网自动登录成功"
         logging.info(result_message)
 
-        if (
-            config["enable_browser_fallback"]
-            and config["post_login_driver_update"]
-            and not args.skip_driver_update
-            and result["connectivity_ok"]
-        ):
+        if config["post_login_driver_update"] and not args.skip_driver_update and result["connectivity_ok"]:
             try:
                 maintain_local_chromedriver()
             except Exception as exc:
