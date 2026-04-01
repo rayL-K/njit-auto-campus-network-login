@@ -9,7 +9,7 @@
 4. 校验是否为期望账号，并尽可能确认外网连通性。
 5. 在脚本结束时弹出对应结果通知。
 
-浏览器登录会优先尝试真实浏览器窗口交互，必要时再退回无界面浏览器。
+浏览器登录会优先尝试真实浏览器窗口交互，必要时再切换到无界面浏览器模式。
 ChromeDriver 的本地维护默认开启，用于保证浏览器登录流程可用。
 """
 
@@ -1388,10 +1388,42 @@ def click_via_os_input(driver, handle: BrowserElementHandle) -> None:
     pyautogui.click(center_x, center_y)
 
 
+def build_operator_match_terms(operator: str, suffix: str) -> list[str]:
+    terms: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip().lower()
+        if value and value not in terms:
+            terms.append(value)
+
+    add(operator)
+    add(suffix)
+
+    alias_map = {
+        "中国移动": ["移动", "cmcc", "校园移动"],
+        "中国联通": ["联通", "lt", "校园联通"],
+        "中国电信": ["电信", "dx", "校园电信"],
+        "校园其他": ["其他", "校园用户", "校园网"],
+    }
+
+    normalized = operator.strip().lower()
+    for key, aliases in alias_map.items():
+        if key in operator or key.lower() in normalized:
+            add(key)
+            for alias in aliases:
+                add(alias)
+
+    return terms
+
+
 def find_browser_operator_candidate(driver, operator: str, suffix: str, mode: str = "option"):
     return driver.execute_script(
         """
-        const operator = (arguments[0] || '').trim().toLowerCase();
+        const rawTerms = Array.isArray(arguments[0]) ? arguments[0] : [arguments[0]];
+        const operatorHints = Array.from(new Set(rawTerms
+            .map((item) => (item || '').trim().toLowerCase())
+            .filter(Boolean)
+            .concat([(arguments[1] || '').trim().toLowerCase()].filter(Boolean))));
         const suffix = (arguments[1] || '').trim().toLowerCase();
         const mode = (arguments[2] || 'option').trim().toLowerCase();
 
@@ -1441,7 +1473,6 @@ def find_browser_operator_candidate(driver, operator: str, suffix: str, mode: st
             return words.some((word) => word && text.includes(word));
         }
 
-        const operatorHints = [operator, suffix].filter(Boolean);
         const knownOperatorWords = ['中国移动', '中国联通', '中国电信', '移动', '联通', '电信', 'cmcc', 'lt', 'dx', '校园网', '校园用户'];
         const triggerWords = ['运营商', '接入方式', '网络类型', '上网方式', '宽带', '用户类型'];
         const selector = "input, button, a, label, div, span, li, td, select, option, [role='button'], [role='option'], [role='radio'], [role='combobox'], [aria-haspopup='listbox']";
@@ -1453,9 +1484,6 @@ def find_browser_operator_candidate(driver, operator: str, suffix: str, mode: st
             let value = 0;
 
             if (mode === 'option') {
-                if (!clickable(el) && tag !== 'option') {
-                    return -1;
-                }
                 if (operatorHints.some((hint) => hint && text === hint)) {
                     value += 260;
                 }
@@ -1464,6 +1492,9 @@ def find_browser_operator_candidate(driver, operator: str, suffix: str, mode: st
                 }
                 if (suffix && [attr(el, 'value'), attr(el, 'data-value')].includes(suffix)) {
                     value += 260;
+                }
+                if (!clickable(el) && tag !== 'option' && value < 200) {
+                    return -1;
                 }
                 if (['option', 'li', 'label', 'button', 'a'].includes(tag) || ['option', 'radio', 'button'].includes(role)) {
                     value += 40;
@@ -1500,14 +1531,49 @@ def find_browser_operator_candidate(driver, operator: str, suffix: str, mode: st
 
         return candidates.length ? candidates[0].el : null;
         """,
-        operator,
+        build_operator_match_terms(operator, suffix),
         suffix,
         mode,
     )
 
 
+def find_browser_operator_candidate_in_frames(
+    driver,
+    operator: str,
+    suffix: str,
+    mode: str,
+    preferred_frame_path: tuple[int, ...] = (),
+) -> BrowserElementHandle | None:
+    frame_paths = [preferred_frame_path]
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+
+    for frame_path in collect_browser_frame_paths(driver):
+        if frame_path not in frame_paths:
+            frame_paths.append(frame_path)
+
+    for frame_path in frame_paths:
+        try:
+            switch_to_browser_frame_path(driver, frame_path)
+        except Exception:
+            continue
+
+        candidate = find_browser_operator_candidate(driver, operator, suffix, mode=mode)
+        if candidate is not None and browser_element_is_usable(candidate, clickable=True):
+            return BrowserElementHandle(frame_path=frame_path, element=candidate)
+
+    return None
+
+
 def click_browser_candidate(driver, frame_path: tuple[int, ...], element: Any, allow_os_click: bool = False) -> None:
     handle = BrowserElementHandle(frame_path=frame_path, element=element)
+    if allow_os_click:
+        activate_browser_window(driver)
+        click_via_os_input(driver, handle)
+        return
+
     try:
         click_browser_element(driver, handle)
         return
@@ -1599,19 +1665,61 @@ def set_browser_operator(
                     click_browser_candidate(driver, frame_path, radio, allow_os_click=allow_os_click)
                 return True
 
-        custom_option = find_browser_operator_candidate(driver, operator, suffix, mode="option")
-        if custom_option is not None and browser_element_is_usable(custom_option, clickable=True):
-            click_browser_candidate(driver, frame_path, custom_option, allow_os_click=allow_os_click)
+        custom_option_handle = find_browser_operator_candidate_in_frames(
+            driver,
+            operator,
+            suffix,
+            mode="option",
+            preferred_frame_path=frame_path,
+        )
+        if custom_option_handle is not None:
+            logging.info("浏览器已定位到运营商候选项，准备点击 %s。", operator)
+            click_browser_candidate(
+                driver,
+                custom_option_handle.frame_path,
+                custom_option_handle.element,
+                allow_os_click=allow_os_click,
+            )
             return True
 
-        custom_trigger = find_browser_operator_candidate(driver, operator, suffix, mode="trigger")
-        if custom_trigger is not None and browser_element_is_usable(custom_trigger, clickable=True):
-            click_browser_candidate(driver, frame_path, custom_trigger, allow_os_click=allow_os_click)
-            time.sleep(0.5)
-            custom_option = find_browser_operator_candidate(driver, operator, suffix, mode="option")
-            if custom_option is not None and browser_element_is_usable(custom_option, clickable=True):
-                click_browser_candidate(driver, frame_path, custom_option, allow_os_click=allow_os_click)
-                return True
+        custom_trigger_handle = find_browser_operator_candidate_in_frames(
+            driver,
+            operator,
+            suffix,
+            mode="trigger",
+            preferred_frame_path=frame_path,
+        )
+        if custom_trigger_handle is not None:
+            logging.info("浏览器已定位到运营商选项栏，准备展开后选择 %s。", operator)
+            click_browser_candidate(
+                driver,
+                custom_trigger_handle.frame_path,
+                custom_trigger_handle.element,
+                allow_os_click=allow_os_click,
+            )
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                custom_option_handle = find_browser_operator_candidate_in_frames(
+                    driver,
+                    operator,
+                    suffix,
+                    mode="option",
+                    preferred_frame_path=custom_trigger_handle.frame_path,
+                )
+                if custom_option_handle is not None:
+                    logging.info("浏览器已在展开后的列表中定位到运营商 %s。", operator)
+                    click_browser_candidate(
+                        driver,
+                        custom_option_handle.frame_path,
+                        custom_option_handle.element,
+                        allow_os_click=allow_os_click,
+                    )
+                    return True
+
+            logging.warning("运营商选项栏已展开，但 3 秒内未找到选项 %s。", operator)
+            return False
 
     return False
 
@@ -1781,7 +1889,7 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
                 page_title = driver.title
             except Exception:
                 page_title = ""
-            raise RetryableLoginError(f"真实浏览器键鼠兜底未发现登录表单。当前页面标题：{page_title or '<空>'}")
+            raise RetryableLoginError(f"真实浏览器登录未发现登录表单。当前页面标题：{page_title or '<空>'}")
 
         if set_browser_operator(
             driver,
@@ -1790,7 +1898,7 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
             preferred_frame_path=id_input.frame_path,
             allow_os_click=True,
         ):
-            logging.info("浏览器兜底已自动选择运营商 %s。", config["operator"])
+            logging.info("浏览器登录已自动选择运营商 %s。", config["operator"])
 
         password_input = find_first_browser_element(
             driver,
@@ -1801,10 +1909,10 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
         )
 
         if password_input is None:
-            raise RetryableLoginError("真实浏览器键鼠兜底未找到密码输入框。")
+            raise RetryableLoginError("真实浏览器登录未找到密码输入框。")
 
         if browser_handles_reference_same_element(driver, id_input, password_input):
-            raise RetryableLoginError("浏览器兜底识别到账号输入框和密码输入框是同一个元素，已停止填写以避免把账号密码都输入到同一输入框。")
+            raise RetryableLoginError("浏览器登录识别到账号输入框和密码输入框是同一个元素，已停止填写以避免把账号密码都输入到同一输入框。")
 
         login_button = find_first_browser_element(
             driver,
@@ -1816,9 +1924,9 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
         )
 
         if login_button is None:
-            raise RetryableLoginError("真实浏览器键鼠兜底未找到登录按钮。")
+            raise RetryableLoginError("真实浏览器登录未找到登录按钮。")
 
-        logging.info("开始执行真实浏览器混合兜底：输入框走 DOM 填值，按钮保留真实点击。")
+        logging.info("开始执行真实浏览器登录：输入框走 DOM 填值，按钮保留真实点击。")
         set_browser_input_value(driver, id_input, account_input_value)
         set_browser_input_value(driver, password_input, config["password"])
         activate_browser_window(driver)
@@ -1848,11 +1956,11 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
         )
 
         if id_input is None:
-            logging.info("无界面浏览器兜底未发现登录表单，校园网门户可能已经在线。")
+            logging.info("无界面浏览器模式未发现登录表单，校园网门户可能已经在线。")
             return
 
         if set_browser_operator(driver, config["operator"], suffix, preferred_frame_path=id_input.frame_path):
-            logging.info("无界面浏览器兜底已自动选择运营商 %s。", config["operator"])
+            logging.info("无界面浏览器模式已自动选择运营商 %s。", config["operator"])
 
         password_input = find_first_browser_element(
             driver,
@@ -1863,10 +1971,10 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
         )
 
         if password_input is None:
-            raise RetryableLoginError("无界面浏览器兜底未找到密码输入框。")
+            raise RetryableLoginError("无界面浏览器模式未找到密码输入框。")
 
         if browser_handles_reference_same_element(driver, id_input, password_input):
-            raise RetryableLoginError("浏览器兜底识别到账号输入框和密码输入框是同一个元素，已停止填写以避免误填。")
+            raise RetryableLoginError("浏览器登录识别到账号输入框和密码输入框是同一个元素，已停止填写以避免误填。")
 
         login_button = find_first_browser_element(
             driver,
@@ -1878,7 +1986,7 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
         )
 
         if login_button is None:
-            raise RetryableLoginError("无界面浏览器兜底未找到登录按钮。")
+            raise RetryableLoginError("无界面浏览器模式未找到登录按钮。")
 
         set_browser_input_value(driver, id_input, account_input_value)
         set_browser_input_value(driver, password_input, config["password"])
@@ -1903,7 +2011,7 @@ def run_browser_fallback(session: requests.Session, config: dict[str, Any], last
     html = fetch_portal_html(session, config["portal_root"])
     status = check_portal_status(session, config["portal_root"])
     if portal_result_is_online(status):
-        logging.warning("进入浏览器兜底前，校园网门户仍显示在线，将先执行注销并刷新 Wi-Fi。")
+        logging.warning("进入浏览器登录前，校园网门户仍显示在线，将先执行注销并刷新 Wi-Fi。")
         logout_via_http(session, config, html, status)
         time.sleep(2)
         refresh_wifi_connection(
@@ -1921,23 +2029,23 @@ def run_browser_fallback(session: requests.Session, config: dict[str, Any], last
         time.sleep(3)
         verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
         if not portal_result_is_online(verified_status):
-            raise RetryableLoginError("真实浏览器模拟键鼠执行后，校园网门户仍显示离线。")
+            raise RetryableLoginError("真实浏览器登录执行后，校园网门户仍显示离线。")
         if not account_matches_expected(config, verified_account, expected_account):
             raise RetryableLoginError(
-                f"真实浏览器模拟键鼠未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
+                f"真实浏览器登录未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
             )
     except RetryableLoginError as exc:
-        logging.warning("真实浏览器模拟键鼠兜底失败，将退回无界面浏览器兜底：%s", exc)
+        logging.warning("真实浏览器登录失败，将切换到无界面浏览器模式：%s", exc)
         fallback_mode = "headless"
         login_via_browser_fallback(config, html, status)
         time.sleep(3)
         verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
 
     if not portal_result_is_online(verified_status):
-        raise last_error or RetryableLoginError("浏览器兜底已执行完毕，但校园网门户仍显示离线。")
+        raise last_error or RetryableLoginError("浏览器登录已执行完毕，但校园网门户仍显示离线。")
     if not account_matches_expected(config, verified_account, expected_account):
         raise last_error or RetryableLoginError(
-            f"浏览器兜底未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
+            f"浏览器登录未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
         )
 
     connectivity_ok, checked_url = check_external_connectivity(
@@ -2110,9 +2218,9 @@ def main() -> int:
             result_message = f"校园网已在线，账号 {account_text} 无需重复认证。"
         elif result["used_browser_fallback"]:
             if result.get("browser_fallback_mode") == "interactive":
-                result_message = f"校园网已恢复联网，账号 {account_text}，使用了真实浏览器模拟键鼠兜底。"
+                result_message = f"校园网已恢复联网，账号 {account_text}，已通过真实浏览器完成登录。"
             else:
-                result_message = f"校园网已恢复联网，账号 {account_text}，使用了无界面浏览器兜底。"
+                result_message = f"校园网已恢复联网，账号 {account_text}，已通过无界面浏览器模式完成登录。"
         else:
             result_message = f"校园网已恢复联网，账号 {account_text}。"
 
