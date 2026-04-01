@@ -146,15 +146,6 @@ if ($customIcon) { $customIcon.Dispose() }
 """
 
 OPERATOR_SUFFIX_HINTS = {
-    "中国移动": "@cmcc",
-    "移动": "@cmcc",
-    "cmcc": "@cmcc",
-    "中国电信": "@dx",
-    "电信": "@dx",
-    "dx": "@dx",
-    "中国联通": "@lt",
-    "联通": "@lt",
-    "lt": "@lt",
     "校园用户": "",
     "校园网": "",
     "校园其他": "",
@@ -592,20 +583,6 @@ def infer_account_suffix(config: dict[str, Any], html: str, status: dict[str, An
         return explicit_suffix
     if "@" in user_id:
         return ""
-
-    current_account = current_portal_account(status)
-    if current_account.startswith(f"{user_id}@"):
-        return current_account[len(user_id):]
-
-    carrier_map = parse_carrier_suffixes(extract_js_string(html, "carrier"))
-    operator = config["operator"]
-    if operator in carrier_map:
-        return carrier_map[operator]
-
-    normalized = operator.lower()
-    for key, suffix in OPERATOR_SUFFIX_HINTS.items():
-        if key in operator or key in normalized:
-            return suffix
 
     return ""
 

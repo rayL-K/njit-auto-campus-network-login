@@ -86,7 +86,6 @@
   "id": "你的学号",
   "password": "你的密码",
   "operator": "中国移动",
-  "account_suffix": "@cmcc",
   "wifi_profile": "B132YYDS",
   "notify": true,
   "post_login_driver_update": true,
@@ -100,7 +99,7 @@
 ### 配置项说明
 
 - `account_suffix`
-  已知运营商后缀时建议显式填写，例如 `@cmcc`。
+  仅当校园网门户明确要求账号后缀时再填写；如果你的登录页直接输入学号即可，建议留空。
 - `wifi_profile`
   已保存的 Wi-Fi 配置名称。
 - `notify`
