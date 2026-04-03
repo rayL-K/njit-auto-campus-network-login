@@ -58,6 +58,16 @@ DEFAULT_CONNECTIVITY_CONFIRM_TIMEOUT_SECONDS = 45
 DEFAULT_CONNECTIVITY_CHECK_INTERVAL_SECONDS = 3
 BROWSER_ELEMENT_SEARCH_POLL_INTERVAL_SECONDS = 0.5
 BROWSER_ELEMENT_SEARCH_FRAME_DEPTH = 3
+BROWSER_FORM_WAIT_TIMEOUT_SECONDS = 20
+BROWSER_LOGOUT_WAIT_TIMEOUT_SECONDS = 8
+BROWSER_PAGE_READY_TIMEOUT_SECONDS = 20
+BROWSER_PAGE_STABILIZE_SECONDS = 1
+BROWSER_POST_LOGOUT_WAIT_SECONDS = 5
+BROWSER_POST_SUBMIT_WAIT_SECONDS = 5
+BROWSER_POST_LOGIN_VERIFY_WAIT_SECONDS = 3
+BROWSER_RELOCATE_LOGIN_BUTTON_WAIT_SECONDS = 5
+BROWSER_WINDOW_RECT = (80, 60, 1280, 900)
+DEFAULT_BROWSER_LOGIN_MODE_SEQUENCE = ("interactive", "headless")
 
 TOAST_ICON_PATHS = {
     "Success": ICON_DIR / "success.svg",
@@ -157,6 +167,35 @@ OPERATOR_SUFFIX_HINTS = {
 class BrowserElementHandle:
     frame_path: tuple[int, ...]
     element: Any
+
+
+@dataclass(frozen=True)
+class BrowserLoginMode:
+    key: str
+    display_name: str
+    headless: bool
+    allow_window_activation: bool = False
+    allow_os_click: bool = False
+    recover_from_logout_page: bool = False
+    treat_missing_login_form_as_success_candidate: bool = False
+
+
+BROWSER_LOGIN_MODES = {
+    "interactive": BrowserLoginMode(
+        key="interactive",
+        display_name="真实浏览器登录",
+        headless=False,
+        allow_window_activation=True,
+        allow_os_click=True,
+        recover_from_logout_page=True,
+    ),
+    "headless": BrowserLoginMode(
+        key="headless",
+        display_name="无界面浏览器模式",
+        headless=True,
+        treat_missing_login_form_as_success_candidate=True,
+    ),
+}
 
 
 class LoginError(RuntimeError):
@@ -1396,7 +1435,7 @@ def submit_browser_login_form(
 ) -> None:
     login_button = find_first_browser_element(
         driver,
-        20,
+        BROWSER_FORM_WAIT_TIMEOUT_SECONDS,
         locators["login"],
         clickable=True,
         description="登录按钮",
@@ -1418,7 +1457,7 @@ def submit_browser_login_form(
 
     refreshed_button = find_first_browser_element(
         driver,
-        5,
+        BROWSER_RELOCATE_LOGIN_BUTTON_WAIT_SECONDS,
         locators["login"],
         clickable=True,
         description="登录按钮",
@@ -1882,143 +1921,110 @@ def get_browser_login_form_locators() -> dict[str, list[tuple[Any, str]]]:
     }
 
 
-def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
+def login_via_browser_mode(
+    config: dict[str, Any],
+    html: str,
+    status: dict[str, Any],
+    browser_mode: BrowserLoginMode,
+) -> None:
     suffix = infer_account_suffix(config, html, status)
     account_input_value = build_login_account(config, suffix)
     locators = get_browser_login_form_locators()
 
-    driver = init_browser(headless=False)
+    driver = init_browser(headless=browser_mode.headless)
     try:
-        driver.set_window_rect(80, 60, 1280, 900)
+        if browser_mode.allow_window_activation:
+            driver.set_window_rect(*BROWSER_WINDOW_RECT)
         driver.get(f"{config['portal_root']}/")
-        wait_for_browser_page_ready(driver, 20)
-        time.sleep(1)
-        activate_browser_window(driver)
+        wait_for_browser_page_ready(driver, BROWSER_PAGE_READY_TIMEOUT_SECONDS)
+        time.sleep(BROWSER_PAGE_STABILIZE_SECONDS)
+        if browser_mode.allow_window_activation:
+            activate_browser_window(driver)
 
         id_input = find_first_browser_element(
             driver,
-            20,
+            BROWSER_FORM_WAIT_TIMEOUT_SECONDS,
             locators["account"],
             description="账号输入框",
             heuristic="account",
         )
 
-        if id_input is None:
+        if id_input is None and browser_mode.recover_from_logout_page:
             logout_button = find_first_browser_element(
                 driver,
-                8,
+                BROWSER_LOGOUT_WAIT_TIMEOUT_SECONDS,
                 locators["logout"],
                 clickable=True,
                 description="注销按钮",
                 heuristic="logout",
             )
             if logout_button is not None:
-                logging.info("真实浏览器当前处于注销页，先模拟点击注销按钮。")
-                click_via_os_input(driver, logout_button)
-                time.sleep(5)
-                wait_for_browser_page_ready(driver, 20)
-                activate_browser_window(driver)
+                logging.info("%s当前处于注销页，先重新定位并点击注销按钮。", browser_mode.display_name)
+                click_browser_candidate(
+                    driver,
+                    logout_button.frame_path,
+                    logout_button.element,
+                    allow_os_click=browser_mode.allow_os_click,
+                )
+                time.sleep(BROWSER_POST_LOGOUT_WAIT_SECONDS)
+                wait_for_browser_page_ready(driver, BROWSER_PAGE_READY_TIMEOUT_SECONDS)
+                if browser_mode.allow_window_activation:
+                    activate_browser_window(driver)
                 id_input = find_first_browser_element(
                     driver,
-                    20,
+                    BROWSER_FORM_WAIT_TIMEOUT_SECONDS,
                     locators["account"],
                     description="账号输入框",
                     heuristic="account",
                 )
 
         if id_input is None:
+            if browser_mode.treat_missing_login_form_as_success_candidate:
+                logging.info("%s未发现登录表单，校园网门户可能已经在线。", browser_mode.display_name)
+                return
+
             page_title = ""
             try:
                 page_title = driver.title
             except Exception:
                 page_title = ""
-            raise RetryableLoginError(f"真实浏览器登录未发现登录表单。当前页面标题：{page_title or '<空>'}")
+            raise RetryableLoginError(f"{browser_mode.display_name}未发现登录表单。当前页面标题：{page_title or '<空>'}")
 
         if set_browser_operator(
             driver,
             config["operator"],
             suffix,
             preferred_frame_path=id_input.frame_path,
-            allow_os_click=True,
+            allow_os_click=browser_mode.allow_os_click,
         ):
-            logging.info("浏览器登录已自动选择运营商 %s。", config["operator"])
+            logging.info("%s已自动选择运营商 %s。", browser_mode.display_name, config["operator"])
 
         password_input = find_first_browser_element(
             driver,
-            20,
+            BROWSER_FORM_WAIT_TIMEOUT_SECONDS,
             locators["password"],
             description="密码输入框",
             heuristic="password",
         )
 
         if password_input is None:
-            raise RetryableLoginError("真实浏览器登录未找到密码输入框。")
+            raise RetryableLoginError(f"{browser_mode.display_name}未找到密码输入框。")
 
         if browser_handles_reference_same_element(driver, id_input, password_input):
-            raise RetryableLoginError("浏览器登录识别到账号输入框和密码输入框是同一个元素，已停止填写以避免把账号密码都输入到同一输入框。")
+            raise RetryableLoginError(
+                f"{browser_mode.display_name}识别到账号输入框和密码输入框是同一个元素，已停止填写以避免误填。"
+            )
 
-        logging.info("开始执行真实浏览器登录：先填写账号密码，再重新定位并提交登录按钮。")
+        logging.info("开始执行%s：先填写账号密码，再重新定位并提交登录按钮。", browser_mode.display_name)
         set_browser_input_value(driver, id_input, account_input_value)
         set_browser_input_value(driver, password_input, config["password"])
         submit_browser_login_form(
             driver,
             locators,
-            mode_name="真实浏览器登录",
-            allow_os_click=True,
+            mode_name=browser_mode.display_name,
+            allow_os_click=browser_mode.allow_os_click,
         )
-        time.sleep(5)
-    finally:
-        driver.quit()
-
-
-def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[str, Any]) -> None:
-    suffix = infer_account_suffix(config, html, status)
-    account_input_value = build_login_account(config, suffix)
-    locators = get_browser_login_form_locators()
-
-    driver = init_browser(headless=True)
-    try:
-        driver.get(f"{config['portal_root']}/")
-        wait_for_browser_page_ready(driver, 20)
-        time.sleep(1)
-
-        id_input = find_first_browser_element(
-            driver,
-            20,
-            locators["account"],
-            description="账号输入框",
-            heuristic="account",
-        )
-
-        if id_input is None:
-            logging.info("无界面浏览器模式未发现登录表单，校园网门户可能已经在线。")
-            return
-
-        if set_browser_operator(driver, config["operator"], suffix, preferred_frame_path=id_input.frame_path):
-            logging.info("无界面浏览器模式已自动选择运营商 %s。", config["operator"])
-
-        password_input = find_first_browser_element(
-            driver,
-            20,
-            locators["password"],
-            description="密码输入框",
-            heuristic="password",
-        )
-
-        if password_input is None:
-            raise RetryableLoginError("无界面浏览器模式未找到密码输入框。")
-
-        if browser_handles_reference_same_element(driver, id_input, password_input):
-            raise RetryableLoginError("浏览器登录识别到账号输入框和密码输入框是同一个元素，已停止填写以避免误填。")
-
-        set_browser_input_value(driver, id_input, account_input_value)
-        set_browser_input_value(driver, password_input, config["password"])
-        submit_browser_login_form(
-            driver,
-            locators,
-            mode_name="无界面浏览器模式",
-        )
-        time.sleep(5)
+        time.sleep(BROWSER_POST_SUBMIT_WAIT_SECONDS)
     finally:
         driver.quit()
 
@@ -2030,7 +2036,23 @@ def verify_portal_login_result(session: requests.Session, config: dict[str, Any]
     return verified_status, expected_account, verified_account
 
 
-def run_browser_fallback(session: requests.Session, config: dict[str, Any], last_error: LoginError | None) -> dict[str, Any]:
+def verify_browser_login_attempt(
+    session: requests.Session,
+    config: dict[str, Any],
+    html: str,
+    browser_mode: BrowserLoginMode,
+) -> tuple[dict[str, Any], str, str]:
+    verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
+    if not portal_result_is_online(verified_status):
+        raise RetryableLoginError(f"{browser_mode.display_name}执行后，校园网门户仍显示离线。")
+    if not account_matches_expected(config, verified_account, expected_account):
+        raise RetryableLoginError(
+            f"{browser_mode.display_name}未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
+        )
+    return verified_status, expected_account, verified_account
+
+
+def run_browser_login(session: requests.Session, config: dict[str, Any]) -> dict[str, Any]:
     logging.info("将执行浏览器登录流程。")
     if not portal_is_reachable(session, config["portal_root"]):
         connect_wifi(config["wifi_profile"], session, config["portal_root"], config["wifi_attempts"])
@@ -2050,30 +2072,31 @@ def run_browser_fallback(session: requests.Session, config: dict[str, Any], last
         html = fetch_portal_html(session, config["portal_root"])
         status = check_portal_status(session, config["portal_root"])
 
-    fallback_mode = "interactive"
-    try:
-        login_via_interactive_browser_fallback(config, html, status)
-        time.sleep(3)
-        verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
-        if not portal_result_is_online(verified_status):
-            raise RetryableLoginError("真实浏览器登录执行后，校园网门户仍显示离线。")
-        if not account_matches_expected(config, verified_account, expected_account):
-            raise RetryableLoginError(
-                f"真实浏览器登录未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
-            )
-    except RetryableLoginError as exc:
-        logging.warning("真实浏览器登录失败，将切换到无界面浏览器模式：%s", exc)
-        fallback_mode = "headless"
-        login_via_browser_fallback(config, html, status)
-        time.sleep(3)
-        verified_status, expected_account, verified_account = verify_portal_login_result(session, config, html)
+    browser_errors: list[str] = []
+    selected_mode_key = ""
+    verified_status: dict[str, Any] = status
+    expected_account = ""
+    verified_account = ""
 
-    if not portal_result_is_online(verified_status):
-        raise last_error or RetryableLoginError("浏览器登录已执行完毕，但校园网门户仍显示离线。")
-    if not account_matches_expected(config, verified_account, expected_account):
-        raise last_error or RetryableLoginError(
-            f"浏览器登录未能切换到目标账号，当前账号为 {verified_account or '<未知>'}。"
-        )
+    for mode_key in DEFAULT_BROWSER_LOGIN_MODE_SEQUENCE:
+        browser_mode = BROWSER_LOGIN_MODES[mode_key]
+        try:
+            login_via_browser_mode(config, html, status, browser_mode)
+            time.sleep(BROWSER_POST_LOGIN_VERIFY_WAIT_SECONDS)
+            verified_status, expected_account, verified_account = verify_browser_login_attempt(
+                session,
+                config,
+                html,
+                browser_mode,
+            )
+            selected_mode_key = browser_mode.key
+            break
+        except RetryableLoginError as exc:
+            browser_errors.append(f"{browser_mode.display_name}：{exc}")
+            logging.warning("%s失败：%s", browser_mode.display_name, exc)
+
+    if not selected_mode_key:
+        raise RetryableLoginError("；".join(browser_errors) or "浏览器登录已执行完毕，但校园网门户仍显示离线。")
 
     connectivity_ok, checked_url = check_external_connectivity(
         session,
@@ -2084,8 +2107,8 @@ def run_browser_fallback(session: requests.Session, config: dict[str, Any], last
     return {
         "account": verified_account or expected_account,
         "already_online": False,
-        "used_browser_fallback": True,
-        "browser_fallback_mode": fallback_mode,
+        "used_browser_login": True,
+        "browser_login_mode": selected_mode_key,
         "connectivity_ok": connectivity_ok,
         "connectivity_url": checked_url,
     }
@@ -2114,7 +2137,7 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
             return {
                 "account": current_account or expected_account,
                 "already_online": True,
-                "used_browser_fallback": False,
+                "used_browser_login": False,
                 "connectivity_ok": True,
                 "connectivity_url": checked_url,
             }
@@ -2127,7 +2150,7 @@ def try_login_once(session: requests.Session, config: dict[str, Any]) -> dict[st
             current_account,
         )
 
-    return run_browser_fallback(session, config, None)
+    return run_browser_login(session, config)
 
 
 def run_login_flow(session: requests.Session, config: dict[str, Any], notify_enabled: bool) -> dict[str, Any]:
@@ -2243,8 +2266,8 @@ def main() -> int:
         account_text = result["account"]
         if result["already_online"]:
             result_message = f"校园网已在线，账号 {account_text} 无需重复认证。"
-        elif result["used_browser_fallback"]:
-            if result.get("browser_fallback_mode") == "interactive":
+        elif result["used_browser_login"]:
+            if result.get("browser_login_mode") == "interactive":
                 result_message = f"校园网已恢复联网，账号 {account_text}，已通过真实浏览器完成登录。"
             else:
                 result_message = f"校园网已恢复联网，账号 {account_text}，已通过无界面浏览器模式完成登录。"
