@@ -1388,6 +1388,49 @@ def click_via_os_input(driver, handle: BrowserElementHandle) -> None:
     pyautogui.click(center_x, center_y)
 
 
+def submit_browser_login_form(
+    driver,
+    locators: dict[str, list[tuple[Any, str]]],
+    mode_name: str,
+    allow_os_click: bool = False,
+) -> None:
+    login_button = find_first_browser_element(
+        driver,
+        20,
+        locators["login"],
+        clickable=True,
+        description="登录按钮",
+        heuristic="login",
+    )
+
+    if login_button is None:
+        raise RetryableLoginError(f"{mode_name}未找到登录按钮。")
+
+    logging.info("%s已重新定位登录按钮，优先尝试 DOM 点击提交。", mode_name)
+    try:
+        click_browser_element(driver, login_button)
+        return
+    except RetryableLoginError as exc:
+        if not allow_os_click:
+            raise RetryableLoginError(f"{mode_name}触发登录按钮失败：{exc}") from exc
+
+        logging.warning("%sDOM 点击登录按钮失败，将回退到真实鼠标点击：%s", mode_name, exc)
+
+    refreshed_button = find_first_browser_element(
+        driver,
+        5,
+        locators["login"],
+        clickable=True,
+        description="登录按钮",
+        heuristic="login",
+    )
+    if refreshed_button is not None:
+        login_button = refreshed_button
+
+    activate_browser_window(driver)
+    click_via_os_input(driver, login_button)
+
+
 def build_operator_match_terms(operator: str, suffix: str) -> list[str]:
     terms: list[str] = []
 
@@ -1914,23 +1957,15 @@ def login_via_interactive_browser_fallback(config: dict[str, Any], html: str, st
         if browser_handles_reference_same_element(driver, id_input, password_input):
             raise RetryableLoginError("浏览器登录识别到账号输入框和密码输入框是同一个元素，已停止填写以避免把账号密码都输入到同一输入框。")
 
-        login_button = find_first_browser_element(
-            driver,
-            20,
-            locators["login"],
-            clickable=True,
-            description="登录按钮",
-            heuristic="login",
-        )
-
-        if login_button is None:
-            raise RetryableLoginError("真实浏览器登录未找到登录按钮。")
-
-        logging.info("开始执行真实浏览器登录：输入框走 DOM 填值，按钮保留真实点击。")
+        logging.info("开始执行真实浏览器登录：先填写账号密码，再重新定位并提交登录按钮。")
         set_browser_input_value(driver, id_input, account_input_value)
         set_browser_input_value(driver, password_input, config["password"])
-        activate_browser_window(driver)
-        click_via_os_input(driver, login_button)
+        submit_browser_login_form(
+            driver,
+            locators,
+            mode_name="真实浏览器登录",
+            allow_os_click=True,
+        )
         time.sleep(5)
     finally:
         driver.quit()
@@ -1976,21 +2011,13 @@ def login_via_browser_fallback(config: dict[str, Any], html: str, status: dict[s
         if browser_handles_reference_same_element(driver, id_input, password_input):
             raise RetryableLoginError("浏览器登录识别到账号输入框和密码输入框是同一个元素，已停止填写以避免误填。")
 
-        login_button = find_first_browser_element(
-            driver,
-            20,
-            locators["login"],
-            clickable=True,
-            description="登录按钮",
-            heuristic="login",
-        )
-
-        if login_button is None:
-            raise RetryableLoginError("无界面浏览器模式未找到登录按钮。")
-
         set_browser_input_value(driver, id_input, account_input_value)
         set_browser_input_value(driver, password_input, config["password"])
-        click_browser_element(driver, login_button)
+        submit_browser_login_form(
+            driver,
+            locators,
+            mode_name="无界面浏览器模式",
+        )
         time.sleep(5)
     finally:
         driver.quit()
