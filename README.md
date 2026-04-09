@@ -17,6 +17,25 @@
 
 真实浏览器路径当前会先通过 DOM 填入账号密码，再重新定位登录按钮并优先尝试 DOM 点击；如果按钮点击失败，才回退到真实鼠标点击。整条真实浏览器路径无法完成时，脚本才会切到无界面浏览器模式继续认证。
 
+## 快速开始
+
+建议按下面顺序完成首次配置：
+
+1. 在 Windows 上安装 Python `3.10+` 和 Chrome。
+2. 安装运行依赖。
+3. 复制 `data.example.json` 为 `data.json`，填入你的校园网账号信息。
+4. 先手动执行一次状态查询和完整登录，确认无误后再注册计划任务。
+
+```powershell
+python -m pip install requests selenium pyautogui
+Copy-Item .\data.example.json .\data.json
+.\login.bat --status
+.\login.bat
+powershell -ExecutionPolicy Bypass -File .\register_task.ps1
+```
+
+`PowerShell` 中请使用 `.\login.bat` 调用批处理；如果你习惯使用 `cmd`，可直接写成 `login.bat`。
+
 ## 功能特性
 
 - 自动检查校园网门户是否可达，必要时自动重连已保存的 Wi-Fi 配置。
@@ -42,12 +61,18 @@
   示例配置文件，不包含真实账号密码。
 - `data.json`
   本机实际运行配置文件，不会提交到 Git。
+- `assets/`
+  通知图标和项目图标资源目录。
+- `logs/`
+  运行日志目录，日志文件按日期生成，例如 `campus_login_20260409.log`。
 
 ## 运行要求
 
 ### 系统要求
 
 - Windows 10 或 Windows 11
+- Python 3.10 或更高版本
+- 已安装可被 Selenium 正常启动的 Chrome
 
 ### Python 依赖
 
@@ -59,6 +84,22 @@
 
 主流程依赖浏览器自动化能力，因此建议保留 `selenium`，并确保本机安装了可被 Selenium 启动的 Chrome。
 
+推荐安装命令：
+
+```powershell
+python -m pip install requests selenium pyautogui
+```
+
+### `login.bat` 的 Python 选择顺序
+
+`login.bat` 会按下面顺序寻找 Python 解释器：
+
+- `D:\Anaconda\envs\web_login\python.exe`
+- `D:\Anaconda\python.exe`
+- 当前 `PATH` 中的 `python`
+
+如果你的 Python 安装位置不同，可以直接修改 `login.bat`，或者确保命令行里能直接执行 `python`。
+
 ### 本地前置条件
 
 - 电脑已经保存校园 Wi-Fi 配置
@@ -68,6 +109,10 @@
 ## 配置文件
 
 请在本地创建 `data.json`，可参考 `data.example.json`。
+
+```powershell
+Copy-Item .\data.example.json .\data.json
+```
 
 ### 最小配置
 
@@ -98,14 +143,16 @@
 }
 ```
 
-### 必填项说明
+### 核心配置项说明
+
+`id` 和 `password` 为必填项；`operator` 在多数校园门户中建议填写，若登录页要求选择运营商，则应视为必填。
 
 - `id`
   登录账号。可以直接填写学号，也可以填写带后缀的完整账号，例如 `xxxx@cmcc`。
 - `password`
   校园网登录密码。
 - `operator`
-  登录页存在运营商下拉框、单选框或自定义选项时，脚本会用它匹配对应的运营商。
+  推荐填写。登录页存在运营商下拉框、单选框或自定义选项时，脚本会用它匹配对应的运营商；如果你的门户不要求选择运营商，也可以留空。
 
 ### 配置项说明
 
@@ -278,6 +325,17 @@ login.bat --no-notify
 ```cmd
 login.bat --skip-driver-update
 ```
+
+## 日志与退出码
+
+- 日志默认写入 `logs/` 目录，文件名格式为 `campus_login_YYYYMMDD.log`。
+- 控制台输出和日志文件会同时保留，便于排查计划任务场景下的问题。
+- 常见退出码如下：
+- `0`：执行成功；或 `--status` 查询到校园网已在线。
+- `1`：`--status` 查询到校园网门户可达，但当前未在线。
+- `2`：`--status` 时校园网门户不可达；或完整登录流程在重试窗口内仍未成功。
+- `3`：不可重试失败，常见于配置错误、账号密码问题或页面返回明确错误。
+- `4`：脚本出现未预期异常。
 
 ## 故障排查
 
