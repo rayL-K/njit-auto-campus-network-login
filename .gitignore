@@ -3,6 +3,7 @@ chromedriver.exe
 logs/
 __pycache__/
 .vscode/
+.omm/
 skills/
 current_portal.html
 a40.js
